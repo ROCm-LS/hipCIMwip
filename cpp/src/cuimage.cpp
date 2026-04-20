@@ -11,14 +11,13 @@
 #include <memory>
 
 #if CUCIM_SUPPORT_CUDA
-#    include <cuda_runtime.h>
+#    include <cucim/cuda_runtime.h>
 #endif
 #include <fmt/format.h>
 
 #include "cucim/profiler/nvtx3.h"
 #include "cucim/util/cuda.h"
 #include "cucim/util/file.h"
-
 
 #define XSTR(x) STR(x)
 #define STR(x) #x
@@ -140,7 +139,7 @@ DetectedFormat detect_format(filesystem::Path path)
 {
     // TODO: implement this
     (void)path;
-    return { "Generic TIFF", { "cucim.kit.cuslide" } };
+    return { "Generic TIFF", { "hipcim.kit.hipslide" } };
 }
 
 
@@ -290,7 +289,7 @@ CuImage::~CuImage()
             case io::DeviceType::kCUDAManaged:
             case io::DeviceType::kCPUShared:
             case io::DeviceType::kCUDAShared:
-                fmt::print(stderr, "Device type {} is not supported!\n", static_cast<int>(device_type));
+                fmt::print(stderr, "Device type is not supported!\n");
                 break;
             }
         }
@@ -1234,7 +1233,7 @@ bool CuImage::crop_image(const io::format::ImageReaderRegionRequestDesc& request
     case cucim::io::DeviceType::kCUDAManaged:
     case cucim::io::DeviceType::kCPUShared:
     case cucim::io::DeviceType::kCUDAShared:
-        throw std::runtime_error(fmt::format("Device type {} not supported!", static_cast<int>(in_device.type())));
+        throw std::runtime_error(fmt::format("Device type not supported!"));
         break;
     }
 
@@ -1438,15 +1437,19 @@ void CuImageIterator<DataType>::increase_index_()
             case io::DeviceType::kCUDA:
                 if (*image_data_ptr)
                 {
-                    cudaError_t cuda_status;
-                    CUDA_ERROR(cudaFree(*image_data_ptr));
+                    cudaError_t free_status = cudaFree(*image_data_ptr);
+                    if (free_status != cudaSuccess) {
+                        // Handle error
+                        fprintf(stderr, "cudaFree failed: %s\n", cudaGetErrorString(free_status));
+                        // Consider appropriate error handling
+                    }
                 }
                 break;
             case io::DeviceType::kCUDAHost:
             case io::DeviceType::kCUDAManaged:
             case io::DeviceType::kCPUShared:
             case io::DeviceType::kCUDAShared:
-                fmt::print(stderr, "Device type {} is not supported!\n", static_cast<int>(device_type));
+                fmt::print(stderr, "Device type is not supported!\n" );
                 break;
             }
 
@@ -1481,3 +1484,6 @@ void CuImageIterator<DataType>::increase_index_()
 }
 
 } // namespace cucim
+
+template class cucim::CuImageIterator<cucim::CuImage>;
+template class cucim::CuImageIterator<const cucim::CuImage>;

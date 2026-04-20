@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
-
 import importlib.resources
 
 __version__ = (
     importlib.resources.files(__package__)
-    .joinpath("VERSION")
+    .joinpath("HIPCIM_VERSION")
     .read_text()
     .strip()
 )

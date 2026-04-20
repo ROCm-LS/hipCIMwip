@@ -7,7 +7,7 @@ import json
 import math
 
 import pytest
-
+import json
 from ...util.io import open_image_cucim
 
 # skip if imagecodecs package not available (needed by ImageGenerator utility)
@@ -65,9 +65,8 @@ def test_load_image_metadata(testimg_tiff_stripe_32x24_16):
     print(metadata)
     assert isinstance(metadata, dict)
     assert len(metadata) == 2  # 'cucim' and 'tiff'
-    # A raw metadata string (compare as parsed JSON to avoid key-order issues).
-    assert json.loads(img.raw_metadata) == {"axes": "YXC", "shape": [24, 32, 3]}
-
+    assert json.loads(img.raw_metadata)["shape"] == [24, 32, 3]
+    assert json.loads(img.raw_metadata)["axes"] == "YXC"
 
 def test_load_image_resolution_metadata(
     testimg_tiff_stripe_4096_4096_256_jpeg_resolution,

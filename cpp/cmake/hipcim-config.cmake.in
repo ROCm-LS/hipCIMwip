@@ -9,8 +9,8 @@
 # ...
 include(CMakeFindDependencyMacro)
 #find_dependency(Boost x.x.x REQUIRED)
-find_dependency(CUDAToolkit)
+#find_dependency(CUDAToolkit)
 
 if(NOT TARGET cucim::cucim)
-    include(${CMAKE_CURRENT_LIST_DIR}/cucim-targets.cmake)
+    include(${CMAKE_CURRENT_LIST_DIR}/hipcim-targets.cmake)
 endif()

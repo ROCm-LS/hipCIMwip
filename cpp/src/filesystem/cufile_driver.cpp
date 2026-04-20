@@ -15,11 +15,11 @@
 
 #include <chrono>
 
-#include <cuda_runtime.h>
+#include <cucim/cuda_runtime.h>
 #include <fmt/format.h>
 
-#include "cucim/util/cuda.h"
 #include "cucim/util/platform.h"
+#include "cucim/util/cuda.h"
 #include "cufile_stub.h"
 
 #define ALIGN_UP(x, align_to) (((uint64_t)(x) + ((uint64_t)(align_to)-1)) & ~((uint64_t)(align_to)-1))
@@ -217,8 +217,8 @@ CuFileDriver::CuFileDriver(int fd, bool no_gds, bool use_mmap, const char* file_
         {
             fmt::print(
                 stderr,
-                "[Error] cuFileHandleRegister fd: {} ({}), status: {}. Would work with cuCIM's compatibility mode.\n",
-                fd, file_path_, cufileop_status_error(status.err));
+                "[Error] cuFileHandleRegister fd: {} ({}), status:  Would work with cuCIM's compatibility mode.\n",
+                fd, file_path_);
         }
     }
     else if (use_mmap)
@@ -334,7 +334,7 @@ CuFileDriverInitializer::~CuFileDriverInitializer()
         CUfileError_t status = cuFileDriverClose();
         if (status.err != CU_FILE_SUCCESS)
         {
-            fmt::print(stderr, "Unable to close cuFileDriver ({})\n", cufileop_status_error(status.err));
+            fmt::print(stderr, "Unable to close cuFileDriver \n" );
         }
         else
         {
@@ -408,7 +408,7 @@ CuFileDriverCache::~CuFileDriverCache()
         CUfileError_t status = cuFileBufDeregister(device_cache_aligned_);
         if (status.err != CU_FILE_SUCCESS)
         {
-            fmt::print(stderr, "Failed on cuFileBufDeregister()! (status: {})\n", cufileop_status_error(status.err));
+            fmt::print(stderr, "Failed on cuFileBufDeregister()!\n" );
         }
         CUDA_TRY(cudaFree(device_cache_));
         if (cuda_status)
@@ -737,6 +737,7 @@ ssize_t CuFileDriver::pread(void* buf, size_t count, off_t file_offset, off_t bu
             }
         }
     }
+#ifndef __HIP_PLATFORM_AMD__
     else if (file_type == FileHandleType::kGPUDirect)
     {
         (void*)s_cufile_cache.device_cache(); // Lazy initialization
@@ -749,7 +750,7 @@ ssize_t CuFileDriver::pread(void* buf, size_t count, off_t file_offset, off_t bu
             return -1;
         }
     }
-
+#endif
     return total_read_cnt;
 }
 ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, off_t buf_offset)
@@ -1095,6 +1096,7 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
             }
         }
     }
+#ifndef __HIP_PLATFORM_AMD__
     else if (file_type == FileHandleType::kGPUDirect)
     {
         (void*)s_cufile_cache.device_cache(); // Lazy initialization
@@ -1103,11 +1105,12 @@ ssize_t CuFileDriver::pwrite(const void* buf, size_t count, off_t file_offset, o
             cuFileWrite(handle_->cufile, reinterpret_cast<const char*>(buf) + buf_offset, count, file_offset, 0);
         if (write_cnt < 0)
         {
-            fmt::print(stderr, "[cuFile Error] {}\n", CUFILE_ERRSTR(write_cnt));
+            fmt::print(stderr, "[cuFile Error] {}\n", abs(write_cnt));
             return -1;
         }
         total_write_cnt += write_cnt;
     }
+#endif
     // Update file size
     if (total_write_cnt > 0)
     {

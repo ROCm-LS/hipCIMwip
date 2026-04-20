@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+
+#include <cucim/cuda_runtime.h>
+
 #include "cufile_stub.h"
 #include "cucim/dynlib/helper.h"
 #include "cucim/util/platform.h"
@@ -51,9 +54,7 @@ void CuFileStub::load()
             // Note: Load the dynamic library with RTLD_NODELETE flag because libcufile.so uses thread_local which can
             // cause a segmentation fault if the library is dynamically loaded/unloaded. (See #158)
             handle_ = cucim::dynlib::load_library(
-                {
                     "libcufile.so.0",
-                },
                 RTLD_LAZY | RTLD_LOCAL | RTLD_NODELETE);
             if (handle_ == nullptr)
             {

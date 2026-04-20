@@ -396,9 +396,6 @@ def test_fundamental_matrix_estimation(xp):
                           [ 0.248062, -0.429478,  0.0221019]])  # noqa
 
     # fmt: on
-    if xp == cp:
-        # TODO: grlee77: why is there a sign difference here for CuPy?
-        tform_ref = -tform_ref
     assert_array_almost_equal(tform.params, tform_ref, 6)
 
 
@@ -530,9 +527,6 @@ def test_essential_matrix_estimation(xp):
                           [ 0.177784, -0.22008,  -0.015203]])  # noqa
 
     # fmt: on
-    if xp == cp:
-        # TODO: grlee77: why is there a sign difference here for CuPy?
-        tform_ref = -tform_ref
     assert_array_almost_equal(tform.params, tform_ref, 6)
 
 
