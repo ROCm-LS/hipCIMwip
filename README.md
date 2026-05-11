@@ -261,6 +261,12 @@ Please use the below steps to build the hipCIM library on a ROCM based MI300 sys
   python3 -m pip install python/cucim --extra-index-url https://pypi.amd.com/rocm-7.0.2/simple/
   ```
 
+- **[First time only]** Generate test data files
+  ```bash
+  # Generate test TIFF images required for C++ tests
+  ./test_data/gen_images.sh
+  ```
+
 - Run all cpp unit tests
   ```bash
   ./run_amd test cpp release
