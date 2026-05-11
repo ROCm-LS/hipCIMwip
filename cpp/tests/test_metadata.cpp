@@ -124,7 +124,15 @@ TEST_CASE("Verify metadata", "[test_metadata.cpp]")
 
 TEST_CASE("Load test", "[test_metadata.cpp]")
 {
-    cucim::CuImage img{ g_config.get_input_path("private/philips_tiff_000.tif") };
+    std::string file_path = g_config.get_input_path("private/philips_tiff_000.tif");
+
+    // Skip test if vendor test file is not available
+    struct stat buffer;
+    if (stat(file_path.c_str(), &buffer) != 0) {
+        SKIP("Vendor test file philips_tiff_000.tif not available - skipping test");
+    }
+
+    cucim::CuImage img{ file_path };
     REQUIRE(img.dtype() == DLDataType{ DLDataTypeCode::kDLUInt, 8, 1 });
     REQUIRE(img.typestr() == "|u1");
 

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <sys/stat.h>
 #include <tiffio.h> // LibTIFF for reading TIFF files
 #include "cuslide/loader/rocjpeg_processor.h"
 
@@ -70,9 +71,15 @@ cuslide::tiff::IFD read_ifd_from_tiff(const std::string& tiff_path) {
 
 TEST_CASE("Verify decode using rocjpeg", "[test_decode.cpp]")
 {
-
     std::string tiff_file_path = g_config.get_input_path("private/generic_tiff_000.tif");
-    auto tif = std::make_shared<cuslide::tiff::TIFF>(g_config.get_input_path("private/generic_tiff_000.tif").c_str(), O_RDONLY);
+
+    // Skip test if vendor test file is not available
+    struct stat buffer;
+    if (stat(tiff_file_path.c_str(), &buffer) != 0) {
+        SKIP("Vendor test file generic_tiff_000.tif not available - skipping test");
+    }
+
+    auto tif = std::make_shared<cuslide::tiff::TIFF>(tiff_file_path.c_str(), O_RDONLY);
     tif->construct_ifds();
     // --- Configuration ---
     const uint32_t batch_size = 4;      // Adjust as needed

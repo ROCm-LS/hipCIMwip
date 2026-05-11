@@ -10,12 +10,21 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
+#include <sys/stat.h>
 
 TEST_CASE("Verify philips tiff file", "[generic_tiff_000.tif]")
 {
     fmt::print("Read Philips TIFF File\n");
 
-    auto tif = std::make_shared<cuslide::tiff::TIFF>(g_config.get_input_path("private/generic_tiff_000.tif").c_str(),
+    std::string file_path = g_config.get_input_path("private/generic_tiff_000.tif");
+
+    // Skip test if vendor test file is not available
+    struct stat buffer;
+    if (stat(file_path.c_str(), &buffer) != 0) {
+        SKIP("Vendor test file generic_tiff_000.tif not available - skipping test");
+    }
+
+    auto tif = std::make_shared<cuslide::tiff::TIFF>(file_path.c_str(),
                                                      O_RDONLY); // , cuslide::tiff::TIFF::kUseLibTiff
     tif->construct_ifds();
 
