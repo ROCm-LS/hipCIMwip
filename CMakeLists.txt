@@ -24,9 +24,14 @@ set(PROJECT_VERSION_BUILD dev)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cpp/cmake/modules")
 project(libcucim VERSION ${VERSION} DESCRIPTION "libcucim" LANGUAGES CXX)
 
-#enable_language(HIP)
-# Example: Echo the value of an environment variable MY_ENV_VAR
-message("The value of CMAKE_MODULE_PATH is: $ENV{CMAKE_MODULE_PATH}")
+# Set CMAKE_PREFIX_PATH for ROCm/HIP if not already set
+if(NOT DEFINED CMAKE_PREFIX_PATH)
+    if(DEFINED ENV{ROCM_PATH})
+        set(CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")
+    elseif(EXISTS "/opt/rocm")
+        set(CMAKE_PREFIX_PATH "/opt/rocm")
+    endif()
+endif()
 
 find_package(HIP REQUIRED)
 enable_language(HIP)
