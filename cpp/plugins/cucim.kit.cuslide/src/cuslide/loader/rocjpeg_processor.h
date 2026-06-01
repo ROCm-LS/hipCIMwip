@@ -104,6 +104,31 @@ private:
     std::vector<const unsigned char*> raw_cuda_inputs_;
     std::vector<size_t> raw_cuda_inputs_len_;
     std::vector<RocJpegImage> raw_cuda_outputs_;
+
+    // SVS / TIFF abbreviated-JPEG support.
+    //
+    // Aperio SVS stores JPEG quantization + Huffman tables once in the TIFF
+    // IFD's JPEGTables tag (0x015B); individual tile bitstreams contain only
+    // [SOI][SOS][scan][EOI] without the tables. rocJPEG has no
+    // tables-injection API equivalent to nvJPEG's
+    // nvjpegDecodeBatchedParseJpegTables, so we pre-merge per tile before
+    // calling rocJpegStreamParse:
+    //
+    //   merged = jpegtable[0 .. size-2)  ++  tile[2 .. tile_size)
+    //          = [SOI][DQT/DHT...]       ++  [...SOS][scan][EOI]
+    //
+    // jpegtable_prefix_host_  : host copy of jpegtable[0..size-2]
+    // jpegtable_prefix_device_: same bytes pre-copied to device memory
+    //                           (allocated only for ROCJPEG_BACKEND_HARDWARE)
+    // merged_arena_{host,device}_: single contiguous arena sliced into
+    //                           cuda_batch_size_ slots of merged_slot_bytes_
+    //                           each, so per-batch allocation cost is paid
+    //                           once at construction.
+    std::vector<uint8_t> jpegtable_prefix_host_;
+    uint8_t* jpegtable_prefix_device_ = nullptr;
+    uint8_t* merged_arena_host_ = nullptr;
+    uint8_t* merged_arena_device_ = nullptr;
+    size_t merged_slot_bytes_ = 0;
 };
 } // namespace cuslide::loader
 #endif // CUSLIDE_ROCJPEG_PROCESSOR_H
