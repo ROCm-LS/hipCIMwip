@@ -20,6 +20,7 @@ add_executable(cuslide_tests
         test_read_rawtiff.cpp
         test_philips_tiff.cpp
         test_rocjpeg_jpegtables.cpp
+        test_ifd_sort.cpp
         )
 set_target_properties(cuslide_tests
     PROPERTIES
