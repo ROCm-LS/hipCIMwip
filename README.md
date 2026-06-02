@@ -453,4 +453,5 @@ is used in this project.
 
 Apache-2.0 License (see [LICENSE](LICENSE) file).
 
-Copyright (c) 2025, AMD CORPORATION.
+Copyright (c) 2020-2026, NVIDIA CORPORATION.
+Modifications Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
