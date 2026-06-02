@@ -619,7 +619,7 @@ test_cpp() {
 	if [ -f test_data/private/generic_tiff_000.tif ]; then
 		./tiff_image test_data/private/generic_tiff_000.tif test_data/private
 	else
-		c_echo Y "[WARN] Skipping tiff_image: test_data/private/generic_tiff_000.tif not available (vendor file, not in git-lfs)"
+		c_echo Y "[WARN] Skipping tiff_image: test_data/private/generic_tiff_000.tif not available"
 	fi
 	#./tiff_image test_data/private/philips_tiff_000.tif test_data/private
 
