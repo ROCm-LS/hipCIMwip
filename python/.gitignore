@@ -4,3 +4,6 @@ cmake-build*
 lib*.so*
 # cucim plugins
 cucim.*.so
+
+# setuptools_scm generated version file (pyproject.toml write_to target)
+__version_tuple.py
