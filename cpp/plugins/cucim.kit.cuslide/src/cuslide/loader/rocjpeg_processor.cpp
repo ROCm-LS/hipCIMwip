@@ -23,7 +23,9 @@
 // =============================================================================
 
 #include "rocjpeg_processor.h"
+#include "rocjpeg_jpegtables.h"
 
+#include <cstring>
 #include <vector>
 #include <cucim/cuda_runtime.h>
 #include <cucim/cache/image_cache_manager.h>
@@ -50,6 +52,21 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
                                  const uint32_t jpegtable_size)
     : cucim::loader::BatchDataProcessor(batch_size), file_handle_(file_handle), ifd_(ifd)
 {
+    // Capture the IFD's JPEGTables prefix once at construction.
+    // See rocjpeg_jpegtables.h for the merged-stream layout rationale.
+    {
+        const size_t prefix_len =
+            detail::jpegtable_prefix_length(jpegtable_data, jpegtable_size);
+        if (prefix_len > 0)
+        {
+            jpegtable_prefix_host_.assign(jpegtable_data,
+                                          jpegtable_data + prefix_len);
+        }
+    }
+    // If the IFD has no JPEGTables tag, jpegtable_prefix_host_ stays empty
+    // and the merge step is a no-op (tile is passed through unchanged), which
+    // is correct for tiles that embed their own tables.
+
     if (maximum_tile_count > 1)
     {
         // Calculate nearlest power of 2 that is equal or larger than the given number.
@@ -146,6 +163,32 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         default:
             throw std::runtime_error("Unsupported backend type");
         }
+
+        // Allocate the merged-JPEG arena. Each batch slot gets
+        // merged_slot_bytes_ contiguous bytes; tile_raster_nbytes_ is a safe
+        // upper bound on the compressed JPEG size (a JPEG tile never expands
+        // to more than its uncompressed raster size in practice) plus the
+        // prefix length, plus a small safety margin.
+        if (!jpegtable_prefix_host_.empty())
+        {
+            const size_t prefix_len = jpegtable_prefix_host_.size();
+            merged_slot_bytes_ = prefix_len + tile_raster_nbytes_ + 64;
+
+            const size_t arena_bytes = static_cast<size_t>(cuda_batch_size_) * merged_slot_bytes_;
+
+            if (backend_ == ROCJPEG_BACKEND_HARDWARE)
+            {
+                // Device-side prefix (copied once) + device-side per-tile arena.
+                CHECK_HIP(hipMalloc(&jpegtable_prefix_device_, prefix_len));
+                CHECK_HIP(hipMemcpy(jpegtable_prefix_device_, jpegtable_prefix_host_.data(),
+                                    prefix_len, hipMemcpyHostToDevice));
+                CHECK_HIP(hipMalloc(&merged_arena_device_, arena_bytes));
+            }
+            else // HYBRID
+            {
+                merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
+            }
+        }
     }
 }
 
@@ -164,6 +207,23 @@ RocJpegProcessor::~RocJpegProcessor()
         CHECK_HIP(hipFree(unaligned_device_));
         unaligned_device_ = nullptr;
         aligned_device_ = nullptr;
+    }
+
+    // Free merged-JPEG arena + device-side JPEGTables prefix.
+    if (jpegtable_prefix_device_)
+    {
+        CHECK_HIP(hipFree(jpegtable_prefix_device_));
+        jpegtable_prefix_device_ = nullptr;
+    }
+    if (merged_arena_device_)
+    {
+        CHECK_HIP(hipFree(merged_arena_device_));
+        merged_arena_device_ = nullptr;
+    }
+    if (merged_arena_host_)
+    {
+        cucim_free(merged_arena_host_);
+        merged_arena_host_ = nullptr;
     }
 
     // Release output buffers for each batch and channel
@@ -313,37 +373,85 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
     }
 
     // Setup inputs, outputs, and decode_params for just as many as request_count
+    const bool need_merge = !jpegtable_prefix_host_.empty();
+    const size_t prefix_len = jpegtable_prefix_host_.size();
+    bool any_parse_failed = false;
+
     for (size_t i = 0; i < request_count; ++i)
     {
-        uint8_t* mem_offset = file_block_ptr + tile_to_request[i].offset - file_start_offset_;
-        raw_cuda_inputs_.push_back((const unsigned char*)mem_offset);
-        raw_cuda_inputs_len_.push_back(tile_to_request[i].size);
+        uint8_t* tile_mem_offset = file_block_ptr + tile_to_request[i].offset - file_start_offset_;
+        const size_t tile_size = tile_to_request[i].size;
 
+        // For SVS / TIFF abbreviated-JPEG tiles, splice the
+        // IFD's JPEGTables prefix into a per-slot merged buffer so the
+        // resulting stream is a complete decodable JPEG.
+        //
+        //   merged = [SOI][DQT/DHT...]  ++  [tile after SOI marker]
+        //
+        // Tile is expected to start with FF D8 (SOI); if not, fall through
+        // to the pass-through path and let rocJpegStreamParse report the
+        // problem rather than silently corrupting the bitstream.
+        const unsigned char* input_ptr = static_cast<const unsigned char*>(tile_mem_offset);
+        size_t input_len = tile_size;
 
-#ifndef NDEBUG
-        // Quick SOI marker check
-        const unsigned char* jpeg_data = (const unsigned char*)mem_offset;
-        if (tile_to_request[i].size < 2 || jpeg_data[0] != 0xFF || jpeg_data[1] != 0xD8) {
-            std::cerr << "**warning**: skipping tile " << i << " (not a valid JPEG SOI)" << std::endl;
-            continue;
+        const size_t merged_len = need_merge
+            ? detail::plan_merged_jpeg_size(prefix_len, tile_mem_offset,
+                                            tile_size, merged_slot_bytes_)
+            : 0;
+        if (merged_len > 0)
+        {
+            if (backend_ == ROCJPEG_BACKEND_HARDWARE)
+            {
+                uint8_t* slot = merged_arena_device_ + (i * merged_slot_bytes_);
+                // prefix: device→device (pre-copied at construction)
+                CHECK_HIP(hipMemcpy(slot, jpegtable_prefix_device_,
+                                    prefix_len, hipMemcpyDeviceToDevice));
+                // tile body (skip 2-byte SOI): device→device
+                CHECK_HIP(hipMemcpy(slot + prefix_len, tile_mem_offset + 2,
+                                    tile_size - 2, hipMemcpyDeviceToDevice));
+                input_ptr = slot;
+            }
+            else // HYBRID — everything is on host
+            {
+                uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
+                detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
+                                                prefix_len,
+                                                tile_mem_offset, tile_size,
+                                                slot);
+                input_ptr = slot;
+            }
+            input_len = merged_len;
         }
 
-        uint32_t width = 0, height = 0;
-        uint8_t ncomp = 0;
-        RocJpegChromaSubsampling subsampling;
-        RocJpegStatus info_status = rocJpegGetImageInfo(handle_,
-                                                        stream_handles_[i],
-                                                        &ncomp, &subsampling,
-                                                        &width, &height);
-        // Validate width, height if required
+        raw_cuda_inputs_.push_back(input_ptr);
+        raw_cuda_inputs_len_.push_back(input_len);
+
+#ifndef NDEBUG
+        // Quick SOI marker check on the *original* tile (the merged buffer
+        // is guaranteed to start with SOI by construction).
+        if (tile_size < 2 || tile_mem_offset[0] != 0xFF || tile_mem_offset[1] != 0xD8) {
+            std::cerr << "**warning**: tile " << i
+                      << " does not start with SOI (FF D8); using raw bytes" << std::endl;
+        }
 #endif // !NDEBUG
 
-        // Each tile must have a valid RocJpegStreamHandle
-        CHECK_ROCJPEG(
-            rocJpegStreamParse(raw_cuda_inputs_[i],
-                               raw_cuda_inputs_len_[i],
-                               stream_handles_[i])
-        );
+        // Each tile must have a valid RocJpegStreamHandle.
+        // Do NOT use CHECK_ROCJPEG (which exit(1)s) — we want to fall
+        // through to a CPU fallback path on BAD_JPEG so a single bad tile
+        // can't take down the whole process.
+        {
+            RocJpegStatus s = rocJpegStreamParse(raw_cuda_inputs_[i],
+                                                 raw_cuda_inputs_len_[i],
+                                                 stream_handles_[i]);
+            if (s != ROCJPEG_STATUS_SUCCESS)
+            {
+                std::cerr << "**warning**: rocJpegStreamParse failed for tile " << i
+                          << " (" << rocJpegGetErrorName(s) << ")"
+                          << std::endl;
+                raw_cuda_inputs_len_.back() = 0;
+                any_parse_failed = true;
+            }
+        }
 
         decode_params_[i].output_format = output_format_;
 
@@ -368,13 +476,32 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         }
     }
 
-    // Batch decode
-    CHECK_ROCJPEG(
-        rocJpegDecodeBatched(handle_, stream_handles_.data(),
-                             request_count,
-                             decode_params_.data(),
-                             raw_cuda_outputs_.data())
-    );
+    // Batch decode: if any per-tile parse failed above, skip
+    // rocJpegDecodeBatched (it would either fail outright or produce
+    // garbage for the bad slot); the caller treats missing cache entries
+    // as misses and the IFD::read_region CPU fallback path takes over.
+    // Use soft status check (not CHECK_ROCJPEG, which exit(1)s) so a
+    // single corrupt tile cannot take down the whole process.
+    if (!any_parse_failed)
+    {
+        RocJpegStatus s = rocJpegDecodeBatched(handle_, stream_handles_.data(),
+                                               request_count,
+                                               decode_params_.data(),
+                                               raw_cuda_outputs_.data());
+        if (s != ROCJPEG_STATUS_SUCCESS)
+        {
+            std::cerr << "**warning**: rocJpegDecodeBatched failed ("
+                      << rocJpegGetErrorName(s)
+                      << "); CPU fallback path will be used for this batch"
+                      << std::endl;
+        }
+    }
+    else
+    {
+        std::cerr << "**warning**: batch contained " << request_count
+                  << " tile(s) with parse errors; skipping GPU decode"
+                  << std::endl;
+    }
 
     // Remove previous batch (keep last 'cuda_batch_size_' items) before adding to cuda_image_cache_
     // TODO: Utilize the removed tiles if next batch uses them.
