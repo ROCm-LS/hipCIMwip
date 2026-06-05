@@ -1,7 +1,7 @@
+// SPDX-FileCopyrightText: Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026, Advanced Micro Devices, Inc.
- * SPDX-License-Identifier: Apache-2.0
- *
  * Pure helpers for splicing an IFD's JPEGTables prefix into an
  * abbreviated per-tile JPEG. Kept dependency-free (no ROCm / no GPU /
  * no rocJPEG headers) so it can be exercised in unit tests on any host.
