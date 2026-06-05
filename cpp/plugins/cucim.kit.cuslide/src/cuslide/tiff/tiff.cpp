@@ -1,9 +1,12 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Modifications Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
  */
 
 #include "tiff.h"
+#include "ifd_sort.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -345,25 +348,15 @@ void TIFF::construct_ifds()
     // Resolve format and fix `level_to_ifds_idx_`
     resolve_vendor_format();
 
-    // Sort index by resolution (the largest resolution is index 0)
-    std::sort(level_to_ifd_idx_.begin(), level_to_ifd_idx_.end(), [this](const size_t& a, const size_t& b) {
-        uint32_t width_a = this->ifds_[a]->width();
-        uint32_t width_b = this->ifds_[b]->width();
-        if (width_a > width_b)
-        {
-            return true;
-        }
-        else if (width_a < width_b)
-        {
-            return false;
-        }
-        else
-        {
-            uint32_t height_a = this->ifds_[a]->height();
-            uint32_t height_b = this->ifds_[b]->height();
-            return height_a > height_b;
-        }
-    });
+    // Sort index by resolution (largest first). See ifd_sort.h for the
+    // stable tiebreak rationale.
+    std::sort(level_to_ifd_idx_.begin(), level_to_ifd_idx_.end(),
+              [this](const size_t& a, const size_t& b) {
+                  return detail::ifd_index_less(
+                      a, b,
+                      [this](size_t i) { return this->ifds_[i]->width(); },
+                      [this](size_t i) { return this->ifds_[i]->height(); });
+              });
 }
 void TIFF::resolve_vendor_format()
 {
