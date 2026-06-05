@@ -1,7 +1,7 @@
+// SPDX-FileCopyrightText: Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2026, Advanced Micro Devices, Inc.
- * SPDX-License-Identifier: Apache-2.0
- *
  * Unit tests for the JPEGTables-merge helpers. These exercise the
  * host-side byte-splicing logic that RocJpegProcessor uses to turn an
  * abbreviated Aperio SVS tile into a self-contained JPEG before handing
