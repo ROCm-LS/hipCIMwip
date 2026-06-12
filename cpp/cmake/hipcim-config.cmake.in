@@ -13,6 +13,6 @@ include(CMakeFindDependencyMacro)
 #find_dependency(Boost x.x.x REQUIRED)
 #find_dependency(CUDAToolkit)
 
-if(NOT TARGET cucim::cucim)
+if(NOT TARGET hipcim::hipcim)
     include(${CMAKE_CURRENT_LIST_DIR}/hipcim-targets.cmake)
 endif()
