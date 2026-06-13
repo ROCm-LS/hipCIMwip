@@ -245,12 +245,22 @@ bool IFD::read(const TIFF* tiff,
             std::unique_ptr<std::vector<int64_t>> request_size = std::move(*size_unique);
             delete size_unique;
 
-            auto load_func = [tiff, ifd, location, w, h, out_device](
+            // The GPU JPEG batch processor only exists for COMPRESSION_JPEG on a
+            // CUDA output. For any other compression the per-tile decoders fill
+            // the loader's raster with host operations (memcpy / memset), so the
+            // loader must work in host memory and the result is staged to the
+            // device afterwards by move_raster_from_host(). Decode/raster ops
+            // therefore use this staging device, not the final output device.
+            const bool use_gpu_batch =
+                (out_device.type() == cucim::io::DeviceType::kCUDA && ifd->compression_ == COMPRESSION_JPEG);
+            cucim::io::Device loader_out_device = use_gpu_batch ? out_device : cucim::io::Device("cpu");
+
+            auto load_func = [tiff, ifd, location, w, h, loader_out_device](
                                  cucim::loader::ThreadBatchDataLoader* loader_ptr, uint64_t location_index) {
                 uint8_t* raster_ptr = loader_ptr->raster_pointer(location_index);
 
                 if (!read_region_tiles(tiff, ifd, location, location_index, w, h,
-                                       raster_ptr, out_device, loader_ptr))
+                                       raster_ptr, loader_out_device, loader_ptr))
                 {
                     fmt::print(stderr, "[Error] Failed to read region!\n");
                 }
@@ -261,8 +271,14 @@ bool IFD::read(const TIFF* tiff,
             std::unique_ptr<cucim::loader::BatchDataProcessor> batch_processor;
 
 
-            // Set raster_type to CUDA because loader will handle this with nvjpeg
-            if (out_device.type() == cucim::io::DeviceType::kCUDA)
+            // Only the GPU JPEG batch processor produces device-resident tiles.
+            // It handles baseline JPEG (COMPRESSION_JPEG) only; other
+            // compressions (e.g. Aperio JPEG 2000 33003/33005, DEFLATE, LZW,
+            // raw) are decoded per-tile into host memory and staged to the
+            // device by move_raster_from_host(). Creating the batch processor
+            // for a non-JPEG IFD would route JP2K tiles into rocJPEG and abort
+            // the process when the per-tile switch hits its default.
+            if (use_gpu_batch)
             {
                 raster_type = cucim::io::DeviceType::kCUDA;
 
@@ -294,9 +310,13 @@ bool IFD::read(const TIFF* tiff,
                 batch_processor = std::move(nvjpeg_processor);
             }
 
+            // loader_out_device (computed above) is the CUDA output device only
+            // when the GPU batch processor is in use; otherwise it is the CPU so
+            // the loader allocates host memory that the per-tile decoders fill
+            // and move_raster_from_host() later stages to the device.
             auto loader = std::make_unique<cucim::loader::ThreadBatchDataLoader>(
-                load_func, std::move(batch_processor), out_device, std::move(request_location), std::move(request_size),
-                location_len, one_raster_size, batch_size, prefetch_factor, num_workers);
+                load_func, std::move(batch_processor), loader_out_device, std::move(request_location),
+                std::move(request_size), location_len, one_raster_size, batch_size, prefetch_factor, num_workers);
 
             const uint32_t load_size = std::min(static_cast<uint64_t>(batch_size) * (1 + prefetch_factor), location_len);
 
@@ -312,12 +332,25 @@ bool IFD::read(const TIFF* tiff,
         }
         else
         {
+            // Single tile-region, no workers. This branch never has a GPU batch
+            // processor, so for a non-JPEG compression on a CUDA output we own a
+            // host raster (cucim_malloc, raster_type kCPU); the per-tile decoders
+            // must run against a host device so their memcpy / background memset
+            // target host memory, and move_raster_from_host() stages the result
+            // to the device. (A caller-supplied output buffer keeps the requested
+            // device.)
+            cucim::io::Device tiles_out_device = out_device;
+            if (!is_buf_available && out_device.type() == cucim::io::DeviceType::kCUDA &&
+                ifd->compression_ != COMPRESSION_JPEG)
+            {
+                tiles_out_device = cucim::io::Device("cpu");
+            }
             if (!raster)
             {
                 raster = cucim_malloc(one_raster_size);
             }
 
-            if (!read_region_tiles(tiff, ifd, location, 0, w, h, raster, out_device, nullptr))
+            if (!read_region_tiles(tiff, ifd, location, 0, w, h, raster, tiles_out_device, nullptr))
             {
                 fmt::print(stderr, "[Error] Failed to read region!\n");
             }
