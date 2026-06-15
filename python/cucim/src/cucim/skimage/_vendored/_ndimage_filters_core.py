@@ -218,6 +218,11 @@ def _call_kernel(
 
 _includes = ""
 if cupy.cuda.runtime.is_hip: # for hip
+    # HIPRTC defines __HIPCC_RTC__ (not __CUDACC_RTC__), so cupy/cuda_workaround.h
+    # is a no-op under HIPRTC and does not pull in <type_traits>. On ROCm > 6 we
+    # therefore include it explicitly; the HIP_VERSION_MAJOR > 6 gate is load-bearing
+    # (mirrors the ROCm <= 6 fallback in measure/_regionprops_gpu_utils.py) and is
+    # kept intentionally rather than adopting the unconditional upstream-CuPy form.
     _includes = r"""
 #if HIP_VERSION_MAJOR > 6
 #include <type_traits>
