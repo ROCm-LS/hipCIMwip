@@ -123,75 +123,24 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
         constexpr int BLOCK_SECTOR_SIZE = 4096;
 
-        // update_file_block_info() sizes file_block_size_ to the contiguous file
-        // span between the first and last requested tile. For a clustered ROI
-        // (a single read_region) that span is small. For a scattered batch
-        // (e.g. random patch sampling across a slide) the first and last tiles
-        // can sit near opposite ends of the file, so the span approaches the
-        // whole slide's tile data (potentially many GB) even though only a few
-        // small tiles inside it are actually needed.
-        //
-        // The HARDWARE backend mirrors that whole span into device memory with a
-        // single hipMalloc. An unbounded span there can exhaust VRAM and abort
-        // the entire process with hipErrorOutOfMemory (CHECK_HIP calls exit()).
-        // Guard it: if the device block would exceed a fraction of currently-free
-        // VRAM, throw a normal C++ exception instead. That propagates out of
-        // read_region() as a recoverable error (the caller can retry on the CPU
-        // device or with a smaller / more spatially-local batch) rather than
-        // taking down the host process. The common clustered-ROI case is well
-        // under the cap and is unaffected.
-        if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-        {
-            size_t free_vram = 0, total_vram = 0;
-            const size_t needed = file_block_size_ + BLOCK_SECTOR_SIZE;
-            if (hipMemGetInfo(&free_vram, &total_vram) == hipSuccess)
-            {
-                // Leave headroom for the merged-JPEG arena, rocJPEG decode
-                // buffers, and other allocations: cap the file block at half of
-                // the currently-free VRAM.
-                const size_t cap = free_vram / 2;
-                if (needed > cap)
-                {
-                    throw std::runtime_error(fmt::format(
-                        "GPU read_region: the requested tiles span a {:.1f} GB file block, which "
-                        "exceeds the {:.1f} GB VRAM budget for a single batch. The requested "
-                        "locations are spread too far across the slide for the GPU batch path. "
-                        "Retry with device=\"cpu\", a smaller batch_size, or spatially-local "
-                        "locations.",
-                        needed / (1024.0 * 1024.0 * 1024.0), cap / (1024.0 * 1024.0 * 1024.0)));
-                }
-            }
-        }
+        // rocJpegStreamParse() parses the JPEG header on the HOST CPU -- it
+        // dereferences the data pointer directly (e.g. the SOI check
+        // `*stream_ != 0xFF` and std::memcpy of the DQT/DHT tables in
+        // rocJpegStreamParser::ParseJpegStream). It therefore requires a HOST
+        // pointer for the compressed input, even for ROCJPEG_BACKEND_HARDWARE.
+        // (rocJPEG's own batched samples read the compressed JPEG into a host
+        // std::vector and pass host .data() to rocJpegStreamParse regardless of
+        // backend; only the decoded OUTPUT is device memory.) Passing a device
+        // pointer here makes the host parser read a device address as host
+        // memory -> garbage -> "Invalid JPEG". So the compressed file block and
+        // the merged-JPEG arena are always host-resident; device memory is
+        // reserved for the decode output only.
+        cufile_ = cucim::filesystem::open(file_handle->path, "rp");
+        unaligned_host_ = static_cast<uint8_t*>(cucim_malloc(file_block_size_ + BLOCK_SECTOR_SIZE * 2));
+        aligned_host_ = reinterpret_cast<uint8_t*>(ALIGN_UP(unaligned_host_, BLOCK_SECTOR_SIZE));
+        cufile_->pread(aligned_host_, file_block_size_, file_start_offset_);
 
-        switch (backend_)
-        {
-        case ROCJPEG_BACKEND_HYBRID :
-            cufile_ = cucim::filesystem::open(file_handle->path, "rp");
-            unaligned_host_ = static_cast<uint8_t*>(cucim_malloc(file_block_size_ + BLOCK_SECTOR_SIZE * 2));
-            aligned_host_ = reinterpret_cast<uint8_t*>(ALIGN_UP(unaligned_host_, BLOCK_SECTOR_SIZE));
-            cufile_->pread(aligned_host_, file_block_size_, file_start_offset_);
-            break;
-        case ROCJPEG_BACKEND_HARDWARE:
-            cufile_ = cucim::filesystem::open(file_handle->path, "r");
-            CHECK_HIP(hipMalloc(&unaligned_device_, file_block_size_ + BLOCK_SECTOR_SIZE));
-            aligned_device_ = reinterpret_cast<uint8_t*>(ALIGN_UP(unaligned_device_, BLOCK_SECTOR_SIZE));
-            cufile_->pread(aligned_device_, file_block_size_, file_start_offset_);
-            break;
-        default:
-            throw std::runtime_error("Unsupported backend type");
-        }
-
-        // Initialize rocJPEG and create handle (with the final backend_ value).
-        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
-
-        // Create stream handles of batch size
-        stream_handles_.resize(cuda_batch_size_);
-        for (uint32_t i = 0; i < cuda_batch_size_; ++i)
-        {
-            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
-        }
-
-        // Allocate the merged-JPEG arena. Each batch slot gets
+        // Allocate the merged-JPEG arena (host). Each batch slot gets
         // merged_slot_bytes_ contiguous bytes; tile_raster_nbytes_ is a safe
         // upper bound on the compressed JPEG size (a JPEG tile never expands
         // to more than its uncompressed raster size in practice) plus the
@@ -203,50 +152,21 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
             const size_t arena_bytes = static_cast<size_t>(cuda_batch_size_) * merged_slot_bytes_;
 
-            if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-            {
-                // Device-side prefix (copied once) + device-side per-tile arena.
-                CHECK_HIP(hipMalloc(&jpegtable_prefix_device_, prefix_len));
-                CHECK_HIP(hipMemcpy(jpegtable_prefix_device_, jpegtable_prefix_host_.data(),
-                                    prefix_len, hipMemcpyHostToDevice));
-                CHECK_HIP(hipMalloc(&merged_arena_device_, arena_bytes));
-            }
-            else // HYBRID
-            {
-                merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
-            }
+            merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
         }
     }
 }
 
 RocJpegProcessor::~RocJpegProcessor()
 {
-    // Free any host-mapped memory (Hybrid backend)
+    // Free the host-resident compressed file block.
     if (unaligned_host_)
     {
         cucim_free(unaligned_host_);
         unaligned_host_ = nullptr;
     }
 
-    // Free any device memory (Hardware backend)
-    if (unaligned_device_)
-    {
-        CHECK_HIP(hipFree(unaligned_device_));
-        unaligned_device_ = nullptr;
-        aligned_device_ = nullptr;
-    }
-
-    // Free merged-JPEG arena + device-side JPEGTables prefix.
-    if (jpegtable_prefix_device_)
-    {
-        CHECK_HIP(hipFree(jpegtable_prefix_device_));
-        jpegtable_prefix_device_ = nullptr;
-    }
-    if (merged_arena_device_)
-    {
-        CHECK_HIP(hipFree(merged_arena_device_));
-        merged_arena_device_ = nullptr;
-    }
+    // Free the host-resident merged-JPEG arena.
     if (merged_arena_host_)
     {
         cucim_free(merged_arena_host_);
@@ -386,18 +306,10 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
     if (decode_params_.size() < request_count)
         decode_params_.resize(request_count);
 
-    uint8_t* file_block_ptr = nullptr;
-    switch (backend_)
-    {
-    case ROCJPEG_BACKEND_HYBRID:
-        file_block_ptr = aligned_host_;
-        break;
-    case ROCJPEG_BACKEND_HARDWARE:
-        file_block_ptr = aligned_device_;
-        break;
-    default:
-        throw std::runtime_error("Unsupported backend type");
-    }
+    // The compressed file block is always host-resident (see constructor):
+    // rocJpegStreamParse reads the JPEG header on the host, so the input it is
+    // handed must be a host pointer for every backend.
+    uint8_t* file_block_ptr = aligned_host_;
 
     // Setup inputs, outputs, and decode_params for just as many as request_count
     const bool need_merge = !jpegtable_prefix_host_.empty();
@@ -456,26 +368,15 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
                 : 0;
             if (merged_len > 0)
             {
-                if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-                {
-                    uint8_t* slot = merged_arena_device_ + (i * merged_slot_bytes_);
-                    // prefix: device→device (pre-copied at construction)
-                    CHECK_HIP(hipMemcpy(slot, jpegtable_prefix_device_,
-                                        prefix_len, hipMemcpyDeviceToDevice));
-                    // tile body (skip 2-byte SOI): device→device
-                    CHECK_HIP(hipMemcpy(slot + prefix_len, tile_mem_offset + 2,
-                                        tile_size - 2, hipMemcpyDeviceToDevice));
-                    input_ptr = slot;
-                }
-                else // HYBRID — everything is on host
-                {
-                    uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
-                    detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
-                                                    prefix_len,
-                                                    tile_mem_offset, tile_size,
-                                                    slot);
-                    input_ptr = slot;
-                }
+                // Splice [JPEGTables prefix] ++ [tile after SOI] into a host
+                // slot. The merged buffer is what rocJpegStreamParse reads, so
+                // it must be host memory for every backend.
+                uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
+                detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
+                                                prefix_len,
+                                                tile_mem_offset, tile_size,
+                                                slot);
+                input_ptr = slot;
                 input_len = merged_len;
             }
 
