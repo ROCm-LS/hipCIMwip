@@ -5,7 +5,9 @@
 #include "rocjpeg_jpegtables.h"
 
 #include <cstring>
+#include <thread>
 #include <vector>
+#include <unistd.h>
 #include <cucim/cuda_runtime.h>
 #include <cucim/cache/image_cache_manager.h>
 #include <cucim/codec/hash_function.h>
@@ -123,8 +125,10 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         // random patch sampling) can span nearly the entire slide, so a single
         // pread of that span would read hundreds of MB to use a few small
         // tiles. Instead each request() reads only the tiles it will decode,
-        // each via its own small pread, into a per-batch host tile arena.
-        cufile_ = cucim::filesystem::open(file_handle->path, "rp");
+        // in parallel, into a per-batch host tile arena, using the slide's own
+        // buffered file descriptor (file_handle_->fd) -- the same descriptor the
+        // CPU libjpeg path uses, so reads are page-cache-eligible (no O_DIRECT
+        // self-penalty) and positional pread() is thread-safe across tiles.
 
         // Per-batch host arena holding the raw compressed bytes of each tile in
         // the current batch. tile_raster_nbytes_ is a safe upper bound on a
@@ -304,24 +308,76 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
     const size_t prefix_len = jpegtable_prefix_host_.size();
     bool any_parse_failed = false;
 
+    // Phase 1: gather the compressed bytes of every valid tile in this batch in
+    // PARALLEL. Scattered tiles sit at random file offsets, so the per-tile read
+    // is latency-bound; issuing them concurrently overlaps that latency instead
+    // of paying it serially. Positional pread() on the same fd is thread-safe
+    // (no shared seek pointer), and each tile writes a disjoint arena slot, so
+    // no synchronization is needed beyond joining. A tile that is zero-length or
+    // larger than its slot is left unread (marked invalid) so it falls back to
+    // CPU decode instead of overrunning the arena.
+    const int fd = file_handle_->fd;
+    std::vector<uint8_t> tile_valid(request_count, 0);
+    {
+        unsigned int hw = std::thread::hardware_concurrency();
+        size_t n_threads = std::min<size_t>(request_count, hw ? hw : 8);
+        if (n_threads < 1)
+            n_threads = 1;
+        auto read_range = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i)
+            {
+                const size_t tsize = tile_to_request[i].size;
+                if (tsize == 0 || tsize > tile_slot_bytes_)
+                    continue; // leave invalid -> CPU fallback
+                uint8_t* dst = tile_arena_host_ + (i * tile_slot_bytes_);
+                size_t got = 0;
+                const off_t base = static_cast<off_t>(tile_to_request[i].offset);
+                while (got < tsize)
+                {
+                    ssize_t r = ::pread(fd, dst + got, tsize - got, base + static_cast<off_t>(got));
+                    if (r <= 0)
+                        break;
+                    got += static_cast<size_t>(r);
+                }
+                if (got == tsize)
+                    tile_valid[i] = 1;
+            }
+        };
+        if (n_threads <= 1)
+        {
+            read_range(0, request_count);
+        }
+        else
+        {
+            std::vector<std::thread> pool;
+            pool.reserve(n_threads);
+            const size_t chunk = (request_count + n_threads - 1) / n_threads;
+            for (size_t t = 0; t < n_threads; ++t)
+            {
+                const size_t b = t * chunk;
+                if (b >= request_count)
+                    break;
+                const size_t e = std::min(request_count, b + chunk);
+                pool.emplace_back(read_range, b, e);
+            }
+            for (auto& th : pool)
+                th.join();
+        }
+    }
+
+    // Phase 2: merge (splice JPEGTables prefix) + parse, reading from the bytes
+    // already gathered in phase 1.
     for (size_t i = 0; i < request_count; ++i)
     {
-        const uint64_t tile_offset = tile_to_request[i].offset;
         const size_t tile_size = tile_to_request[i].size;
 
         const unsigned char* input_ptr = nullptr;
         size_t input_len = 0;
 
-        // Gather only this tile's compressed bytes (no whole-span mirror): read
-        // exactly [tile_offset, tile_offset+tile_size) into this batch slot's
-        // host tile-arena. A tile larger than the slot (should not happen for a
-        // valid JPEG tile, whose compressed size is below its raster size) is
-        // treated as a parse failure so the CPU fallback path decodes it,
-        // rather than overrunning the arena.
-        if (tile_size == 0 || tile_size > tile_slot_bytes_)
+        if (!tile_valid[i])
         {
             std::cerr << "**warning**: tile " << i << " (size " << tile_size
-                      << ") is zero or exceeds the tile slot capacity " << tile_slot_bytes_
+                      << ") is zero/oversized or its read was short"
                       << "; skipping GPU decode for this tile" << std::endl;
             raw_cuda_inputs_.push_back(nullptr);
             raw_cuda_inputs_len_.push_back(0);
@@ -330,7 +386,6 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         else
         {
             uint8_t* tile_mem_offset = tile_arena_host_ + (i * tile_slot_bytes_);
-            cufile_->pread(tile_mem_offset, tile_size, static_cast<off_t>(tile_offset));
 
             // For SVS / TIFF abbreviated-JPEG tiles, splice the
             // IFD's JPEGTables prefix into a per-slot merged buffer so the
