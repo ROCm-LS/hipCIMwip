@@ -5,6 +5,7 @@
 #include "rocjpeg_jpegtables.h"
 
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <cucim/cuda_runtime.h>
 #include <cucim/cache/image_cache_manager.h>
@@ -405,67 +406,95 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
 
     for (size_t i = 0; i < request_count; ++i)
     {
-        uint8_t* tile_mem_offset = file_block_ptr + tile_to_request[i].offset - file_start_offset_;
+        const uint64_t tile_offset = tile_to_request[i].offset;
         const size_t tile_size = tile_to_request[i].size;
 
-        // For SVS / TIFF abbreviated-JPEG tiles, splice the
-        // IFD's JPEGTables prefix into a per-slot merged buffer so the
-        // resulting stream is a complete decodable JPEG.
-        //
-        //   merged = [SOI][DQT/DHT...]  ++  [tile after SOI marker]
-        //
-        // Tile is expected to start with FF D8 (SOI); if not, fall through
-        // to the pass-through path and let rocJpegStreamParse report the
-        // problem rather than silently corrupting the bitstream.
-        const unsigned char* input_ptr = static_cast<const unsigned char*>(tile_mem_offset);
-        size_t input_len = tile_size;
+        // Defense in depth: the file block is sized in update_file_block_info()
+        // to contain every covered tile, but never trust the offset blindly --
+        // a tile whose [offset, offset+size) falls outside the mirrored block
+        // would make the pointer arithmetic below underflow and dereference
+        // wild memory. Treat such a tile as a parse failure (zero-length input
+        // => zero-size cache value => the caller's CPU fallback path decodes
+        // it) instead of crashing the process. The output buffer is still
+        // allocated below so the cache-insertion memcpy has a valid source.
+        const bool tile_in_block =
+            (tile_offset >= file_start_offset_) &&
+            (tile_offset + tile_size <= file_start_offset_ + file_block_size_);
 
-        const size_t merged_len = need_merge
-            ? detail::plan_merged_jpeg_size(prefix_len, tile_mem_offset,
-                                            tile_size, merged_slot_bytes_)
-            : 0;
-        if (merged_len > 0)
+        const unsigned char* input_ptr = nullptr;
+        size_t input_len = 0;
+
+        if (!tile_in_block)
         {
-            if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-            {
-                uint8_t* slot = merged_arena_device_ + (i * merged_slot_bytes_);
-                // prefix: device→device (pre-copied at construction)
-                CHECK_HIP(hipMemcpy(slot, jpegtable_prefix_device_,
-                                    prefix_len, hipMemcpyDeviceToDevice));
-                // tile body (skip 2-byte SOI): device→device
-                CHECK_HIP(hipMemcpy(slot + prefix_len, tile_mem_offset + 2,
-                                    tile_size - 2, hipMemcpyDeviceToDevice));
-                input_ptr = slot;
-            }
-            else // HYBRID — everything is on host
-            {
-                uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
-                detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
-                                                prefix_len,
-                                                tile_mem_offset, tile_size,
-                                                slot);
-                input_ptr = slot;
-            }
-            input_len = merged_len;
+            std::cerr << "**warning**: tile " << i << " (offset " << tile_offset
+                      << ", size " << tile_size << ") falls outside the mirrored file block ["
+                      << file_start_offset_ << ", " << (file_start_offset_ + file_block_size_)
+                      << "); skipping GPU decode for this tile" << std::endl;
+            raw_cuda_inputs_.push_back(nullptr);
+            raw_cuda_inputs_len_.push_back(0);
+            any_parse_failed = true;
         }
+        else
+        {
+            uint8_t* tile_mem_offset = file_block_ptr + tile_offset - file_start_offset_;
 
-        raw_cuda_inputs_.push_back(input_ptr);
-        raw_cuda_inputs_len_.push_back(input_len);
+            // For SVS / TIFF abbreviated-JPEG tiles, splice the
+            // IFD's JPEGTables prefix into a per-slot merged buffer so the
+            // resulting stream is a complete decodable JPEG.
+            //
+            //   merged = [SOI][DQT/DHT...]  ++  [tile after SOI marker]
+            //
+            // Tile is expected to start with FF D8 (SOI); if not, fall through
+            // to the pass-through path and let rocJpegStreamParse report the
+            // problem rather than silently corrupting the bitstream.
+            input_ptr = static_cast<const unsigned char*>(tile_mem_offset);
+            input_len = tile_size;
+
+            const size_t merged_len = need_merge
+                ? detail::plan_merged_jpeg_size(prefix_len, tile_mem_offset,
+                                                tile_size, merged_slot_bytes_)
+                : 0;
+            if (merged_len > 0)
+            {
+                if (backend_ == ROCJPEG_BACKEND_HARDWARE)
+                {
+                    uint8_t* slot = merged_arena_device_ + (i * merged_slot_bytes_);
+                    // prefix: device→device (pre-copied at construction)
+                    CHECK_HIP(hipMemcpy(slot, jpegtable_prefix_device_,
+                                        prefix_len, hipMemcpyDeviceToDevice));
+                    // tile body (skip 2-byte SOI): device→device
+                    CHECK_HIP(hipMemcpy(slot + prefix_len, tile_mem_offset + 2,
+                                        tile_size - 2, hipMemcpyDeviceToDevice));
+                    input_ptr = slot;
+                }
+                else // HYBRID — everything is on host
+                {
+                    uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
+                    detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
+                                                    prefix_len,
+                                                    tile_mem_offset, tile_size,
+                                                    slot);
+                    input_ptr = slot;
+                }
+                input_len = merged_len;
+            }
+
+            raw_cuda_inputs_.push_back(input_ptr);
+            raw_cuda_inputs_len_.push_back(input_len);
 
 #ifndef NDEBUG
-        // Quick SOI marker check on the *original* tile (the merged buffer
-        // is guaranteed to start with SOI by construction).
-        if (tile_size < 2 || tile_mem_offset[0] != 0xFF || tile_mem_offset[1] != 0xD8) {
-            std::cerr << "**warning**: tile " << i
-                      << " does not start with SOI (FF D8); using raw bytes" << std::endl;
-        }
+            // Quick SOI marker check on the *original* tile (the merged buffer
+            // is guaranteed to start with SOI by construction).
+            if (tile_size < 2 || tile_mem_offset[0] != 0xFF || tile_mem_offset[1] != 0xD8) {
+                std::cerr << "**warning**: tile " << i
+                          << " does not start with SOI (FF D8); using raw bytes" << std::endl;
+            }
 #endif // !NDEBUG
 
-        // Each tile must have a valid RocJpegStreamHandle.
-        // Do NOT use CHECK_ROCJPEG (which exit(1)s) — we want to fall
-        // through to a CPU fallback path on BAD_JPEG so a single bad tile
-        // can't take down the whole process.
-        {
+            // Each tile must have a valid RocJpegStreamHandle.
+            // Do NOT use CHECK_ROCJPEG (which exit(1)s) — we want to fall
+            // through to a CPU fallback path on BAD_JPEG so a single bad tile
+            // can't take down the whole process.
             RocJpegStatus s = rocJpegStreamParse(raw_cuda_inputs_[i],
                                                  raw_cuda_inputs_len_[i],
                                                  stream_handles_[i]);
@@ -662,17 +691,47 @@ void RocJpegProcessor::update_file_block_info(const int64_t* request_location,
     // its width/height (potentially covering more tiles) are included.
     int64_t additional_index_x = (static_cast<uint64_t>(w) + (tile_width_ - 1)) / tile_width_;
     int64_t additional_index_y = (static_cast<uint64_t>(h) + (tile_height_ - 1)) / tile_height_;
-    min_tile_index = std::max(min_tile_index, 0L);
-    max_tile_index =
-        std::min(stride_x * stride_y - 1,
-                 static_cast<uint32_t>(max_tile_index + (additional_index_y * stride_y) + additional_index_x));
+    max_tile_index += (additional_index_y * stride_y) + additional_index_x;
 
-    // Retrieve the file offsets for the first/last JPEG tiles that need to be read.
+    // Retrieve the file offsets for the JPEG tiles that need to be read.
     auto& image_piece_offsets = const_cast<std::vector<uint64_t>&>(ifd_->image_piece_offsets());
     auto& image_piece_bytecounts = const_cast<std::vector<uint64_t>&>(ifd_->image_piece_bytecounts());
+    const int64_t tile_count = static_cast<int64_t>(image_piece_offsets.size());
 
-    uint64_t min_offset = image_piece_offsets[min_tile_index];
-    uint64_t max_offset = image_piece_offsets[max_tile_index] + image_piece_bytecounts[max_tile_index];
+    // Clamp the covered index range to the valid tile array bounds. BOTH ends
+    // must be clamped: a request whose location maps to an index >= tile_count
+    // (e.g. an out-of-bounds or transposed coordinate) would otherwise index
+    // image_piece_offsets[] out of range and crash the host process.
+    min_tile_index = std::max<int64_t>(min_tile_index, 0);
+    max_tile_index = std::min<int64_t>(max_tile_index, tile_count - 1);
+    if (tile_count == 0 || min_tile_index > max_tile_index)
+    {
+        // No valid tiles cover the request; leave the (file_size_) defaults so
+        // the caller's CPU fallback path can take over without a wild read.
+        return;
+    }
+
+    // The tile index range is contiguous, but a TIFF/SVS file does NOT
+    // guarantee that a tile's file offset increases monotonically with its
+    // index (SVS in particular interleaves tile data). Deriving the block
+    // bounds from only image_piece_offsets[min_index] / [max_index] therefore
+    // does not necessarily bracket every covered tile's bytes. request() later
+    // addresses each tile as (file_block_base + tile.offset - file_start_offset_),
+    // so if a covered tile's offset falls outside [file_start_offset_,
+    // file_start_offset_ + file_block_size_) that pointer arithmetic underflows
+    // and dereferences wild memory -> SIGSEGV.
+    //
+    // Scan the actual offsets/bytecounts across the covered index range and take
+    // the true min start and max end so the block provably contains every tile.
+    uint64_t min_offset = std::numeric_limits<uint64_t>::max();
+    uint64_t max_offset = 0;
+    for (int64_t idx = min_tile_index; idx <= max_tile_index; ++idx)
+    {
+        const uint64_t off = image_piece_offsets[idx];
+        const uint64_t end = off + image_piece_bytecounts[idx];
+        min_offset = std::min(min_offset, off);
+        max_offset = std::max(max_offset, end);
+    }
 
     // Start offset and size of the file block to be read, covering
     // the requested tiles.
