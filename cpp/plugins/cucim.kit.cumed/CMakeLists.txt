@@ -113,6 +113,7 @@ superbuild_depend(catch2)
 superbuild_depend(googletest)
 superbuild_depend(googlebenchmark)
 superbuild_depend(cli11)
+superbuild_depend(libdeflate)
 
 ################################################################################
 # Find cucim package
@@ -146,6 +147,7 @@ endif()
 add_library(${CUCIM_PLUGIN_NAME}
     src/cumed/cumed.cpp
     src/cumed/cumed.h
+    src/cumed/nifti.h
     )
 
 # Compile options
@@ -167,6 +169,7 @@ target_compile_definitions(${CUCIM_PLUGIN_NAME} PRIVATE __HIP_PLATFORM_AMD__)
 target_link_libraries(${CUCIM_PLUGIN_NAME}
         PRIVATE
             deps::fmt
+            deps::libdeflate
             hipcim::hipcim
         )
 
