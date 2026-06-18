@@ -5,7 +5,7 @@
 # Modifications Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 # cmake-format: on
 
-cmake_minimum_required(VERSION 3.30.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 
 ################################################################################
 # Prerequisite statements
