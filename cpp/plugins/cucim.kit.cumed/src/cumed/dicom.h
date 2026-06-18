@@ -201,16 +201,18 @@ static inline DicomInfo parse(int fd)
     size_t pos = 132; // start of File Meta group
 
     // ── Parse File Meta group (always Explicit VR LE) ─────────────────────────
-    // Read (0002,0000) MetaInformationGroupLength first
+    // (0002,0000) UL MetaInformationGroupLength — always the first tag.
+    // Layout (Explicit VR, UL not in 4-byte-length list):
+    //   pos+0..+1: group 0x0002
+    //   pos+2..+3: element 0x0000
+    //   pos+4..+5: VR "UL"
+    //   pos+6..+7: 2-byte length = 4
+    //   pos+8..+11: uint32 value = number of bytes from start of (0002,0001) to end of meta group
     if (pos + 12 > size) throw std::runtime_error("DICOM: truncated meta header");
     uint32_t meta_tag = make_tag(read_u16(data+pos), read_u16(data+pos+2));
     if (meta_tag != TAG_META_LENGTH) throw std::runtime_error("DICOM: first tag must be (0002,0000)");
-    // skip VR "UL" + 2-byte len
-    uint32_t meta_value_len = read_u32(data+pos+8);
-    uint32_t meta_group_end = static_cast<uint32_t>(pos + 12 + 4 + meta_value_len); // overshoot ok
-    // Read meta group length from value
-    uint32_t meta_len = read_u32(data+pos+12);
-    size_t meta_end = pos + 12 + 4 + meta_len; // actual end of meta group
+    uint32_t meta_len = read_u32(data+pos+8);  // value of (0002,0000)
+    size_t meta_end = pos + 12 + meta_len;     // pos+12 = start of (0002,0001); +meta_len = end of meta group
 
     // Scan meta group for TransferSyntaxUID
     size_t p = pos;
