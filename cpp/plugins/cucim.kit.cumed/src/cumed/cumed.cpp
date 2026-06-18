@@ -6,6 +6,11 @@
 
 #include "cumed.h"
 #include "nifti.h"
+#include "dicom.h"
+
+// DICOM pixel decoders (reused from cuslide)
+#include "cuslide/jpeg/libjpeg_turbo.h"
+#include "cuslide/jpeg2k/libopenjpeg.h"
 
 #include <cmath>
 #include <fcntl.h>
@@ -51,11 +56,29 @@ static bool is_nifti(const std::string& path)
     return false;
 }
 
+static bool is_dicom_by_extension(const std::string& path)
+{
+    auto ext = std::filesystem::path(path).extension().string();
+    return ext == ".dcm" || ext == ".DCM";
+}
+
+// Check DICM magic at byte 128 from an open fd (fast, doesn't read whole file)
+static bool is_dicom_by_magic(int fd)
+{
+    char magic[4];
+    if (::pread(fd, magic, 4, 128) == 4 && memcmp(magic, "DICM", 4) == 0)
+        return true;
+    return false;
+}
+
 static bool CUCIM_ABI checker_is_valid(const char* file_name, const char* buf, size_t size)
 {
-    (void)buf; (void)size;
     std::string path(file_name);
     if (is_nifti(path)) return true;
+    // DICOM: prefer magic check (buf may carry first bytes) or extension fallback
+    if (size >= 132 && buf && memcmp(buf+128, "DICM", 4) == 0) return true;
+    if (is_dicom_by_extension(path)) return true;
+    // MetaIO legacy
     auto ext = std::filesystem::path(file_name).extension().string();
     if (ext == ".mhd") return true;
     return false;
@@ -66,6 +89,7 @@ struct CumedFileState
 {
     std::string path;
     bool        is_nifti = false;
+    bool        is_dicom = false;
 };
 
 static CuCIMFileHandle_share CUCIM_ABI parser_open(const char* file_path_)
@@ -84,7 +108,9 @@ static CuCIMFileHandle_share CUCIM_ABI parser_open(const char* file_path_)
         throw std::invalid_argument(fmt::format("Cannot open {}!", file_path));
     }
 
-    auto* state = new CumedFileState{std::string(file_path_cstr), is_nifti(file_path_cstr)};
+    bool nifti = is_nifti(file_path_cstr);
+    bool dcm   = !nifti && (is_dicom_by_extension(file_path_cstr) || is_dicom_by_magic(fd));
+    auto* state = new CumedFileState{std::string(file_path_cstr), nifti, dcm};
     auto file_handle = std::make_shared<CuCIMFileHandle>(fd, nullptr, FileHandleType::kPosix, file_path_cstr, state);
     return new std::shared_ptr<CuCIMFileHandle>(std::move(file_handle));
 }
@@ -238,6 +264,180 @@ static bool parser_parse_nifti(CuCIMFileHandle* handle,
     return true;
 }
 
+// ── DICOM parser_parse ────────────────────────────────────────────────────────
+static bool parser_parse_dicom(CuCIMFileHandle* handle,
+                               cucim::io::format::ImageMetadata& out_metadata)
+{
+    auto info = cumed::dicom::parse(handle->fd);
+    auto& resource = out_metadata.get_resource();
+
+    // Phase 1: single-frame 2D — dims = "YXC" (samples C last)
+    const uint16_t ndim = 3;
+    std::string_view dims{"YXC"};
+    std::pmr::vector<int64_t> shape({(int64_t)info.rows, (int64_t)info.columns, (int64_t)info.samples}, &resource);
+
+    DLDataType dtype = cumed::dicom::dicom_dtype(info);
+
+    std::pmr::vector<std::string_view> channel_names(&resource);
+    if (info.samples == 1)
+        channel_names.emplace_back("intensity");
+    else {
+        channel_names.emplace_back("R");
+        channel_names.emplace_back("G");
+        channel_names.emplace_back("B");
+    }
+
+    // Spacing: row-spacing, col-spacing (mm), no physical C spacing
+    std::pmr::vector<float> spacing(&resource);
+    spacing.emplace_back(info.pixel_spacing[0]);
+    spacing.emplace_back(info.pixel_spacing[1]);
+    spacing.emplace_back(1.f);
+    std::pmr::vector<std::string_view> spacing_units(&resource);
+    spacing_units.emplace_back("millimeter");
+    spacing_units.emplace_back("millimeter");
+    spacing_units.emplace_back("color");
+
+    // Origin from ImagePositionPatient
+    std::pmr::vector<float> origin({info.image_pos[0], info.image_pos[1], info.image_pos[2]}, &resource);
+
+    // Direction from ImageOrientationPatient: 6 values = row cosines (3) + col cosines (3)
+    // Third row = cross product
+    float* r = info.image_orient; float* c = info.image_orient+3;
+    float n0 = r[1]*c[2]-r[2]*c[1], n1 = r[2]*c[0]-r[0]*c[2], n2 = r[0]*c[1]-r[1]*c[0];
+    std::pmr::vector<float> direction({r[0],r[1],r[2],c[0],c[1],c[2],n0,n1,n2}, &resource);
+
+    // DICOM coordinate system is LPS (not RAS like NIfTI)
+    std::string_view coord_sys{"LPS"};
+
+    std::pmr::vector<int64_t> level_dims(&resource);
+    level_dims.emplace_back(info.columns); level_dims.emplace_back(info.rows);
+    std::pmr::vector<float> level_ds(&resource); level_ds.emplace_back(1.f);
+    std::pmr::vector<uint32_t> level_ts(&resource);
+    level_ts.emplace_back(info.columns); level_ts.emplace_back(info.rows);
+
+    std::string json = fmt::format(
+        "{{\"dicom\":{{\"transfer_syntax\":\"{}\",\"photometric\":\"{}\""
+        ",\"rescale_slope\":{},\"rescale_intercept\":{}}}}}",
+        info.transfer_syntax_uid, info.photometric,
+        info.rescale_slope, info.rescale_intercept);
+    char* json_ptr = static_cast<char*>(cucim_malloc(json.size()+1));
+    memcpy(json_ptr, json.c_str(), json.size()+1);
+
+    out_metadata.ndim(ndim);
+    out_metadata.dims(std::move(dims));
+    out_metadata.shape(std::move(shape));
+    out_metadata.dtype(dtype);
+    out_metadata.channel_names(std::move(channel_names));
+    out_metadata.spacing(std::move(spacing));
+    out_metadata.spacing_units(std::move(spacing_units));
+    out_metadata.origin(std::move(origin));
+    out_metadata.direction(std::move(direction));
+    out_metadata.coord_sys(std::move(coord_sys));
+    out_metadata.level_count(1);
+    out_metadata.level_ndim(2);
+    out_metadata.level_dimensions(std::move(level_dims));
+    out_metadata.level_downsamples(std::move(level_ds));
+    out_metadata.level_tile_sizes(std::move(level_ts));
+    out_metadata.image_count(0);
+    out_metadata.image_names(std::pmr::vector<std::string_view>(&resource));
+    out_metadata.raw_data(std::string_view{""});
+    out_metadata.json_data(std::string_view{json_ptr, json.size()});
+    return true;
+}
+
+// ── DICOM reader_read ─────────────────────────────────────────────────────────
+static bool reader_read_dicom(CuCIMFileHandle* handle,
+                              const cucim::io::format::ImageMetadataDesc* metadata,
+                              const cucim::io::format::ImageReaderRegionRequestDesc* request,
+                              cucim::io::format::ImageDataDesc* out_image_data)
+{
+    (void)metadata;
+    std::string device_name(request->device ? request->device : "cpu");
+    if (request->shm_name)
+        device_name += fmt::format("[{}]", request->shm_name);
+    cucim::io::Device out_device(device_name);
+
+    auto info = cumed::dicom::parse(handle->fd);
+
+    size_t bytes_per_sample = info.bits_alloc / 8;
+    size_t raster_size = (size_t)info.rows * info.columns * info.samples * bytes_per_sample;
+
+    uint8_t* raster = nullptr;
+
+    switch(info.compression)
+    {
+    case cumed::dicom::Compression::Raw:
+    {
+        raster = static_cast<uint8_t*>(cucim_malloc(raster_size));
+        memcpy(raster, info.raw_bytes.data() + info.pixel_data_offset, raster_size);
+        break;
+    }
+    case cumed::dicom::Compression::Jpeg2000:
+    {
+        if (info.frames.empty())
+            throw std::runtime_error("DICOM JP2K: no encapsulated frames found");
+        auto [foff, flen] = info.frames[0];
+        uint8_t* frame_ptr = info.raw_bytes.data() + foff;
+
+        // Detect raw J2K codestream (FF 4F FF 51) vs JP2 box format (00 00 00 0C 6A 50)
+        cuslide::jpeg2k::ColorSpace cs = (info.photometric.find("YBR") != std::string::npos)
+            ? cuslide::jpeg2k::ColorSpace::kSYCC : cuslide::jpeg2k::ColorSpace::kRGB;
+        if (!cuslide::jpeg2k::decode_libopenjpeg(
+                -1, frame_ptr, 0, flen, &raster, raster_size, out_device, cs))
+            throw std::runtime_error("DICOM: JPEG2000 decode failed");
+        // decode_libopenjpeg stages to device itself if kCUDA — skip move_raster_from_host
+        out_image_data->container.data = raster;
+        goto fill_container;
+    }
+    case cumed::dicom::Compression::JpegBaseline:
+    {
+        if (info.frames.empty())
+            throw std::runtime_error("DICOM JPEG: no encapsulated frames found");
+        auto [foff, flen] = info.frames[0];
+        uint8_t* frame_ptr = info.raw_bytes.data() + foff;
+        int color_space = (info.samples == 1) ? 2 /* JCS_GRAYSCALE */ : 0 /* JCS_UNKNOWN */;
+        if (!cuslide::jpeg::decode_libjpeg(
+                -1, frame_ptr, 0, flen, nullptr, 0, &raster, out_device, color_space))
+            throw std::runtime_error("DICOM: JPEG Baseline decode failed");
+        // decode_libjpeg stages to device itself
+        out_image_data->container.data = raster;
+        goto fill_container;
+    }
+    default:
+        throw std::runtime_error(fmt::format(
+            "DICOM: unsupported transfer syntax '{}' (JPEG-LS, JPEG Extended not supported in Phase 1)",
+            info.transfer_syntax_uid));
+    }
+
+    // For raw (uncompressed): stage to GPU
+    cucim::memory::move_raster_from_host((void**)&raster, raster_size, out_device);
+    out_image_data->container.data = raster;
+
+fill_container:;
+    const uint16_t ndim = 3;
+    int64_t* container_shape = static_cast<int64_t*>(cucim_malloc(sizeof(int64_t)*ndim));
+    container_shape[0] = info.rows;
+    container_shape[1] = info.columns;
+    container_shape[2] = info.samples;
+
+    auto& out_image_container = out_image_data->container;
+    out_image_container.device      = DLDevice{static_cast<DLDeviceType>(out_device.type()), out_device.index()};
+    out_image_container.ndim        = ndim;
+    out_image_container.dtype       = cumed::dicom::dicom_dtype(info);
+    out_image_container.shape       = container_shape;
+    out_image_container.strides     = nullptr;
+    out_image_container.byte_offset = 0;
+
+    auto& shm_name = out_device.shm_name();
+    if (!shm_name.empty()) {
+        out_image_data->shm_name = static_cast<char*>(cucim_malloc(shm_name.size()+1));
+        memcpy(out_image_data->shm_name, shm_name.c_str(), shm_name.size()+1);
+    } else {
+        out_image_data->shm_name = nullptr;
+    }
+    return true;
+}
+
 static bool CUCIM_ABI parser_parse(CuCIMFileHandle_ptr handle_ptr,
                                    cucim::io::format::ImageMetadataDesc* out_metadata_desc)
 {
@@ -251,6 +451,9 @@ static bool CUCIM_ABI parser_parse(CuCIMFileHandle_ptr handle_ptr,
     auto* state = static_cast<CumedFileState*>(handle->client_data);
     if (state && state->is_nifti)
         return parser_parse_nifti(handle, out_metadata, state->path);
+
+    if (state && state->is_dicom)
+        return parser_parse_dicom(handle, out_metadata);
 
     // ── Fallback: MetaIO skeleton (unchanged) ─────────────────────────────────
     auto& resource = out_metadata.get_resource();
@@ -377,6 +580,9 @@ static bool CUCIM_ABI reader_read(const CuCIMFileHandle_ptr handle_ptr,
 
     if (state && state->is_nifti)
         return reader_read_nifti(handle, metadata, request, out_image_data, state->path);
+
+    if (state && state->is_dicom)
+        return reader_read_dicom(handle, metadata, request, out_image_data);
 
     // ── Fallback: MetaIO skeleton (returns zeroed 256x256x3) ─────────────────
     std::string device_name(request->device ? request->device : "cpu");
