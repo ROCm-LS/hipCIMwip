@@ -86,14 +86,10 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
         cuda_batch_size_ = cuda_batch_size;
 
-	      // Initialize rocJPEG and create handle
-	      CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
-
-	      // Create stream handles of batch size
-	      stream_handles_.resize(cuda_batch_size_);
-	      for (int i = 0; i < cuda_batch_size_; ++i) {
-            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
-        }
+        // NOTE: rocJpegCreate() is deferred until after the file-block backend
+        // decision below, so the rocJPEG handle is created with the final
+        // backend_ value (which may be demoted HARDWARE -> HYBRID when the
+        // requested file span is too large for VRAM).
 
         // Inputs to rocJPEG for decoding
         raw_cuda_inputs_.resize(cuda_batch_size_);
@@ -125,6 +121,47 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         update_file_block_info(request_location, request_size, location_len);
 
         constexpr int BLOCK_SECTOR_SIZE = 4096;
+
+        // update_file_block_info() sizes file_block_size_ to the contiguous file
+        // span between the first and last requested tile. For a clustered ROI
+        // (a single read_region) that span is small. For a scattered batch
+        // (e.g. random patch sampling across a slide) the first and last tiles
+        // can sit near opposite ends of the file, so the span approaches the
+        // whole slide's tile data (potentially many GB) even though only a few
+        // small tiles inside it are actually needed.
+        //
+        // The HARDWARE backend mirrors that whole span into device memory with a
+        // single hipMalloc. An unbounded span there can exhaust VRAM and abort
+        // the entire process with hipErrorOutOfMemory (CHECK_HIP calls exit()).
+        // Guard it: if the device block would exceed a fraction of currently-free
+        // VRAM, throw a normal C++ exception instead. That propagates out of
+        // read_region() as a recoverable error (the caller can retry on the CPU
+        // device or with a smaller / more spatially-local batch) rather than
+        // taking down the host process. The common clustered-ROI case is well
+        // under the cap and is unaffected.
+        if (backend_ == ROCJPEG_BACKEND_HARDWARE)
+        {
+            size_t free_vram = 0, total_vram = 0;
+            const size_t needed = file_block_size_ + BLOCK_SECTOR_SIZE;
+            if (hipMemGetInfo(&free_vram, &total_vram) == hipSuccess)
+            {
+                // Leave headroom for the merged-JPEG arena, rocJPEG decode
+                // buffers, and other allocations: cap the file block at half of
+                // the currently-free VRAM.
+                const size_t cap = free_vram / 2;
+                if (needed > cap)
+                {
+                    throw std::runtime_error(fmt::format(
+                        "GPU read_region: the requested tiles span a {:.1f} GB file block, which "
+                        "exceeds the {:.1f} GB VRAM budget for a single batch. The requested "
+                        "locations are spread too far across the slide for the GPU batch path. "
+                        "Retry with device=\"cpu\", a smaller batch_size, or spatially-local "
+                        "locations.",
+                        needed / (1024.0 * 1024.0 * 1024.0), cap / (1024.0 * 1024.0 * 1024.0)));
+                }
+            }
+        }
+
         switch (backend_)
         {
         case ROCJPEG_BACKEND_HYBRID :
@@ -141,6 +178,16 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
             break;
         default:
             throw std::runtime_error("Unsupported backend type");
+        }
+
+        // Initialize rocJPEG and create handle (with the final backend_ value).
+        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
+
+        // Create stream handles of batch size
+        stream_handles_.resize(cuda_batch_size_);
+        for (uint32_t i = 0; i < cuda_batch_size_; ++i)
+        {
+            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
         }
 
         // Allocate the merged-JPEG arena. Each batch slot gets
