@@ -8,9 +8,11 @@
 #include "nifti.h"
 #include "dicom.h"
 
-// DICOM pixel decoders (reused from cuslide)
+#ifdef CUMED_DICOM_COMPRESSED
+// DICOM pixel decoders (reused from cuslide; requires -DCUMED_DICOM_COMPRESSED=ON)
 #include "cuslide/jpeg/libjpeg_turbo.h"
 #include "cuslide/jpeg2k/libopenjpeg.h"
+#endif
 
 #include <cmath>
 #include <fcntl.h>
@@ -374,38 +376,44 @@ static bool reader_read_dicom(CuCIMFileHandle* handle,
     }
     case cumed::dicom::Compression::Jpeg2000:
     {
+#ifdef CUMED_DICOM_COMPRESSED
         if (info.frames.empty())
             throw std::runtime_error("DICOM JP2K: no encapsulated frames found");
         auto [foff, flen] = info.frames[0];
         uint8_t* frame_ptr = info.raw_bytes.data() + foff;
-
-        // Detect raw J2K codestream (FF 4F FF 51) vs JP2 box format (00 00 00 0C 6A 50)
         cuslide::jpeg2k::ColorSpace cs = (info.photometric.find("YBR") != std::string::npos)
             ? cuslide::jpeg2k::ColorSpace::kSYCC : cuslide::jpeg2k::ColorSpace::kRGB;
         if (!cuslide::jpeg2k::decode_libopenjpeg(
                 -1, frame_ptr, 0, flen, &raster, raster_size, out_device, cs))
             throw std::runtime_error("DICOM: JPEG2000 decode failed");
-        // decode_libopenjpeg stages to device itself if kCUDA — skip move_raster_from_host
         out_image_data->container.data = raster;
         goto fill_container;
+#else
+        throw std::runtime_error(
+            "DICOM JPEG2000 decode requires building with -DCUMED_DICOM_COMPRESSED=ON");
+#endif
     }
     case cumed::dicom::Compression::JpegBaseline:
     {
+#ifdef CUMED_DICOM_COMPRESSED
         if (info.frames.empty())
             throw std::runtime_error("DICOM JPEG: no encapsulated frames found");
-        auto [foff, flen] = info.frames[0];
-        uint8_t* frame_ptr = info.raw_bytes.data() + foff;
-        int color_space = (info.samples == 1) ? 2 /* JCS_GRAYSCALE */ : 0 /* JCS_UNKNOWN */;
+        auto [foff2, flen2] = info.frames[0];
+        uint8_t* frame_ptr2 = info.raw_bytes.data() + foff2;
+        int color_space = (info.samples == 1) ? 2 : 0;
         if (!cuslide::jpeg::decode_libjpeg(
-                -1, frame_ptr, 0, flen, nullptr, 0, &raster, out_device, color_space))
+                -1, frame_ptr2, 0, flen2, nullptr, 0, &raster, out_device, color_space))
             throw std::runtime_error("DICOM: JPEG Baseline decode failed");
-        // decode_libjpeg stages to device itself
         out_image_data->container.data = raster;
         goto fill_container;
+#else
+        throw std::runtime_error(
+            "DICOM JPEG Baseline decode requires building with -DCUMED_DICOM_COMPRESSED=ON");
+#endif
     }
     default:
         throw std::runtime_error(fmt::format(
-            "DICOM: unsupported transfer syntax '{}' (JPEG-LS, JPEG Extended not supported in Phase 1)",
+            "DICOM: unsupported transfer syntax '{}' (JPEG-LS not supported)",
             info.transfer_syntax_uid));
     }
 
