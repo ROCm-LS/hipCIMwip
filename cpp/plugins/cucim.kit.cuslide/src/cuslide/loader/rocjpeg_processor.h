@@ -92,7 +92,7 @@ private:
     std::vector<RocJpegDecodeParams> decode_params_;
 
     std::condition_variable cuda_batch_cond_;
-    std::unique_ptr<cucim::cache::ImageCache> cuda_image_cache_;
+    std::shared_ptr<cucim::cache::ImageCache> cuda_image_cache_; // process-level GPU tile cache
     uint64_t processed_cuda_batch_count_ = 0;
     cucim::loader::TileInfo fetch_after_{ -1, -1, 0, 0 };
     std::deque<uint32_t> cache_tile_queue_;
