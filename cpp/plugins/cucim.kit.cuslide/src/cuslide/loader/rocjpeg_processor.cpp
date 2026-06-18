@@ -54,16 +54,24 @@ constexpr uint32_t MAX_CUDA_BATCH_SIZE = 1024;
 // Process-level GPU tile cache shared across all RocJpegProcessor instances.
 // Tiles decoded by one read_region() call are available on cache hits in subsequent calls,
 // matching the CPU path's use of the global ImageCache.
-static std::shared_ptr<cucim::cache::ImageCache> s_gpu_tile_cache()
+//
+// The cache is intentionally leaked (never destroyed) via a raw pointer to avoid calling
+// cudaFree / hipFree in a static destructor after the HIP/ROCr runtime has been torn
+// down, which would crash or hang. At process exit the OS reclaims all device memory anyway.
+static std::shared_ptr<cucim::cache::ImageCache>& s_gpu_tile_cache()
 {
-    static std::shared_ptr<cucim::cache::ImageCache> cache = []() {
+    static std::shared_ptr<cucim::cache::ImageCache>* cache = []() {
         cucim::cache::ImageCacheConfig cfg{};
         cfg.type = cucim::cache::CacheType::kPerProcess;
         cfg.memory_capacity = 1024 * 1024; // effectively unbounded (1 TB sentinel)
-        cfg.capacity = 1024;               // up to 1024 decoded GPU tiles across calls
-        return cucim::cache::ImageCacheManager::create_cache(cfg, cucim::io::DeviceType::kCUDA);
+        // 4096 tiles ≈ 4× MAX_CUDA_BATCH_SIZE (1024), leaving headroom for a full batch
+        // plus cross-call reuse without self-eviction within a single batch.
+        cfg.capacity = 4096;
+        cfg.record_stat = true;   // track hit/miss to validate reuse in benchmarks
+        return new std::shared_ptr<cucim::cache::ImageCache>(
+            cucim::cache::ImageCacheManager::create_cache(cfg, cucim::io::DeviceType::kCUDA));
     }();
-    return cache;
+    return *cache;
 }
 
 RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
@@ -601,7 +609,7 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         uint32_t index = added_tile.index;
         uint64_t index_hash = cucim::codec::splitmix64(index);
 
-        auto key = cuda_image_cache_->create_key(0, index);
+        auto key = cuda_image_cache_->create_key(ifd_->hash_value_, index);
 
         cuda_image_cache_->lock(index_hash);
 
@@ -679,7 +687,7 @@ std::shared_ptr<cucim::cache::ImageCacheValue> RocJpegProcessor::wait_for_proces
             value = std::shared_ptr<cucim::cache::ImageCacheValue>();
             return true;
         }
-        auto key = cuda_image_cache_->create_key(0, index);
+        auto key = cuda_image_cache_->create_key(ifd_->hash_value_, index);
         value = cuda_image_cache_->find(key);
         return static_cast<bool>(value);
     });
