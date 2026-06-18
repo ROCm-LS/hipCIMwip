@@ -1090,12 +1090,12 @@ void CuImage::ensure_init()
             const auto& image_formats =
                 framework_->acquire_interface_from_library<cucim::io::format::IImageFormat>(plugin_file_path.c_str());
 
-            image_format_plugins_->add_interfaces(image_formats);
-
             if (image_formats == nullptr)
             {
-                throw std::runtime_error(fmt::format("Dependent library '{}' cannot be loaded!", plugin_file_path));
+                CUCIM_LOG_WARN("[Plugin: %s] Could not load plugin; it will be unavailable.", plugin_file_path.c_str());
+                continue;
             }
+            image_format_plugins_->add_interfaces(image_formats);
         }
     }
 }
