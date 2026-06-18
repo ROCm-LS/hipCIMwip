@@ -22,6 +22,21 @@ namespace cuslide::loader
 
 constexpr uint32_t MAX_CUDA_BATCH_SIZE = 1024;
 
+// Process-level GPU tile cache shared across all RocJpegProcessor instances.
+// Tiles decoded by one read_region() call are available on cache hits in subsequent calls,
+// matching the CPU path's use of the global ImageCache.
+static std::shared_ptr<cucim::cache::ImageCache> s_gpu_tile_cache()
+{
+    static std::shared_ptr<cucim::cache::ImageCache> cache = []() {
+        cucim::cache::ImageCacheConfig cfg{};
+        cfg.type = cucim::cache::CacheType::kPerProcess;
+        cfg.memory_capacity = 1024 * 1024; // effectively unbounded (1 TB sentinel)
+        cfg.capacity = 1024;               // up to 1024 decoded GPU tiles across calls
+        return cucim::cache::ImageCacheManager::create_cache(cfg, cucim::io::DeviceType::kCUDA);
+    }();
+    return cache;
+}
+
 RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
                                  const cuslide::tiff::IFD* ifd,
                                  const int64_t* request_location,
@@ -76,15 +91,19 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         // E.g., (128 - 1) / 32 + 1 ~= 4 => 8 (for 256 tiles) for cuda_batch_size(=128) and batch_size(=32)
         preferred_loader_prefetch_factor_ = ((cuda_batch_size - 1) / batch_size_ + 1) * 2;
 
-        // Create cuda image cache (device)
-        cucim::cache::ImageCacheConfig cache_config{};
-        cache_config.type = cucim::cache::CacheType::kPerProcess;
-        cache_config.memory_capacity = 1024 * 1024; // 1TB: set to fairly large memory so that
-                                                    // memory_capacity is not a limiter.
-        cache_config.capacity = cuda_batch_size * 2; // limit the number of cache item to
-                                                     // cuda_batch_size * 2
-        cuda_image_cache_ =
-            std::move(cucim::cache::ImageCacheManager::create_cache(cache_config, cucim::io::DeviceType::kCUDA));
+        // Use the process-level GPU tile cache so decoded tiles survive across read_region()
+        // calls. The CPU path already shares a global ImageCache (CuImage::cache_manager().cache());
+        // the GPU path previously created a per-call cache that was destroyed with the
+        // RocJpegProcessor, discarding all cached tiles at the end of every read_region().
+        // A process-level cache allows the second and subsequent read_region() calls that
+        // re-sample the same tiles (e.g. multi-epoch training) to hit the cache and skip
+        // rocJPEG decode entirely.
+        //
+        // The cache is keyed by (ifd_hash, tile_index) and stores device pointers
+        // (DeviceType::kCUDA). It is separate from the CPU global cache to avoid
+        // device-type mismatches: a tile cached as kCPU must not be returned to a GPU
+        // consumer without a host→device copy.
+        cuda_image_cache_ = s_gpu_tile_cache();
 
         cuda_batch_size_ = cuda_batch_size;
 
@@ -206,7 +225,9 @@ RocJpegProcessor::~RocJpegProcessor()
         cufile_.reset(); // Release the shared_ptr ownership, deleting if refcount==0
     }
 
-    // cuda_image_cache_: handled by unique_ptr
+    // cuda_image_cache_ is a shared_ptr to the process-level GPU tile cache; releasing
+    // our reference here does not destroy the cache (the static in s_gpu_tile_cache()
+    // holds the last reference for the process lifetime).
     cuda_image_cache_.reset();
 }
 
@@ -496,12 +517,9 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
                   << std::endl;
     }
 
-    // Remove previous batch (keep last 'cuda_batch_size_' items) before adding to cuda_image_cache_
-    // TODO: Utilize the removed tiles if next batch uses them.
-    while (cuda_image_cache_->size() > request_count)
-    {
-        cuda_image_cache_->remove_front();
-    }
+    // The process-level cache manages its own capacity (LRU eviction up to capacity=1024 tiles).
+    // We no longer manually evict tiles here — doing so would discard cached tiles that could
+    // be reused by the next read_region() call (cross-call reuse is the point of the shared cache).
 
     // Add to image cache
     for (uint32_t i = 0; i < request_count; ++i)
