@@ -114,6 +114,9 @@ superbuild_depend(googletest)
 superbuild_depend(googlebenchmark)
 superbuild_depend(cli11)
 superbuild_depend(libdeflate)
+# DICOM pixel decoders (reused from cuslide — JPEG Baseline + JPEG2000)
+superbuild_depend(libjpeg-turbo)
+superbuild_depend(libopenjpeg)
 
 ################################################################################
 # Find cucim package
@@ -144,10 +147,15 @@ endif()
 ################################################################################
 
 # Add library
+set(CUSLIDE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../cucim.kit.cuslide/src)
 add_library(${CUCIM_PLUGIN_NAME}
     src/cumed/cumed.cpp
     src/cumed/cumed.h
     src/cumed/nifti.h
+    src/cumed/dicom.h
+    # DICOM pixel decoders reused from cuslide (no separate linking needed — compile directly)
+    ${CUSLIDE_SRC}/cuslide/jpeg/libjpeg_turbo.cpp
+    ${CUSLIDE_SRC}/cuslide/jpeg2k/libopenjpeg.cpp
     )
 
 # Compile options
@@ -170,6 +178,8 @@ target_link_libraries(${CUCIM_PLUGIN_NAME}
         PRIVATE
             deps::fmt
             deps::libdeflate
+            deps::libjpeg-turbo
+            deps::libopenjpeg
             hipcim::hipcim
         )
 
@@ -181,6 +191,9 @@ target_include_directories(${CUCIM_PLUGIN_NAME}
             ${CMAKE_CURRENT_LIST_DIR}/src
             # turbojpeg.h is not included in 'turbojpeg-static' so manually include
             ${deps-libjpeg-turbo_SOURCE_DIR}
+            # DICOM decoder headers from cuslide
+            ${CUSLIDE_SRC}
+            ${deps-openjpeg_SOURCE_DIR}/src/lib/openjp2
         )
 
 # Do not generate SONAME as this would be used as plugin
