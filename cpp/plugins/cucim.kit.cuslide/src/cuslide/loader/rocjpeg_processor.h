@@ -65,7 +65,6 @@ public:
     void shutdown() override;
     uint32_t preferred_loader_prefetch_factor();
 private:
-    void update_file_block_info(const int64_t* request_location, const int64_t* request_size, uint64_t location_len);
     bool stopped_ = false;
     uint32_t preferred_loader_prefetch_factor_ = 2;
     CuCIMFileHandle* file_handle_ = nullptr;
@@ -75,13 +74,16 @@ private:
     size_t tile_width_bytes_ = 0;
     size_t tile_height_ = 0;
     size_t tile_raster_nbytes_ = 0;
-    size_t file_size_ = 0;
-    size_t file_start_offset_ = 0;
-    size_t file_block_size_ = 0;
     uint32_t cuda_batch_size_ = 1;
 
     RocJpegStreamHandle handle_ = nullptr;
     RocJpegOutputFormat output_format_ = ROCJPEG_OUTPUT_RGB;
+    // Aperio/Generic RGB-photometric tiles store JPEG components that are already
+    // R,G,B (not YCbCr). ROCJPEG_OUTPUT_RGB unconditionally applies a YCbCr->RGB
+    // matrix, which corrupts genuine-RGB data. For those IFDs we decode NATIVE
+    // (no colour transform) and interleave the three planes ourselves. YCbCr
+    // tiles keep the standard ROCJPEG_OUTPUT_RGB path.
+    bool decode_native_rgb_ = false;
     RocJpegStatus state_;
     RocJpegBackend backend_ = ROCJPEG_BACKEND_HARDWARE;
     hipStream_t stream_ = nullptr;
@@ -96,10 +98,16 @@ private:
     std::deque<uint32_t> cache_tile_queue_;
     std::unordered_map<uint32_t, cucim::loader::TileInfo> cache_tile_map_;
 
-    uint8_t* unaligned_host_ = nullptr;
-    uint8_t* aligned_host_ = nullptr;
-    uint8_t* unaligned_device_ = nullptr;
-    uint8_t* aligned_device_ = nullptr;
+    // Per-batch host arena holding the raw compressed bytes of each tile in the
+    // current batch. Only the tiles actually decoded by a request() are read
+    // (gathered via per-tile pread) into their cuda_batch_size_ slots of
+    // tile_slot_bytes_ each -- so a spatially-scattered batch never reads more
+    // than the tiles it needs, instead of mirroring the whole [min..max] file
+    // span. Host-resident because rocJpegStreamParse reads the JPEG header on
+    // the host CPU even for ROCJPEG_BACKEND_HARDWARE; device memory is used only
+    // for the decoded output (raw_cuda_outputs_).
+    uint8_t* tile_arena_host_ = nullptr;
+    size_t tile_slot_bytes_ = 0;
 
     std::vector<const unsigned char*> raw_cuda_inputs_;
     std::vector<size_t> raw_cuda_inputs_len_;
@@ -117,17 +125,14 @@ private:
     //   merged = jpegtable[0 .. size-2)  ++  tile[2 .. tile_size)
     //          = [SOI][DQT/DHT...]       ++  [...SOS][scan][EOI]
     //
-    // jpegtable_prefix_host_  : host copy of jpegtable[0..size-2]
-    // jpegtable_prefix_device_: same bytes pre-copied to device memory
-    //                           (allocated only for ROCJPEG_BACKEND_HARDWARE)
-    // merged_arena_{host,device}_: single contiguous arena sliced into
-    //                           cuda_batch_size_ slots of merged_slot_bytes_
-    //                           each, so per-batch allocation cost is paid
-    //                           once at construction.
+    // jpegtable_prefix_host_ : host copy of jpegtable[0..size-2]
+    // merged_arena_host_     : single contiguous HOST arena sliced into
+    //                          cuda_batch_size_ slots of merged_slot_bytes_
+    //                          each, so per-batch allocation cost is paid once
+    //                          at construction. Host-resident because the
+    //                          merged stream is what rocJpegStreamParse reads.
     std::vector<uint8_t> jpegtable_prefix_host_;
-    uint8_t* jpegtable_prefix_device_ = nullptr;
     uint8_t* merged_arena_host_ = nullptr;
-    uint8_t* merged_arena_device_ = nullptr;
     size_t merged_slot_bytes_ = 0;
 };
 } // namespace cuslide::loader

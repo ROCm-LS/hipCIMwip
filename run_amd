@@ -306,6 +306,7 @@ build_local_hipslide_() {
         -DCMAKE_BUILD_TYPE=${build_type_str} \
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
+        -DGPU_TARGETS=${AMDGPU_TARGETS} \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
     ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipslide -- -j $(nproc)

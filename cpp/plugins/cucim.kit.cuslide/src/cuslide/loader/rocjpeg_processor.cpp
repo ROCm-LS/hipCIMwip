@@ -5,19 +5,49 @@
 #include "rocjpeg_jpegtables.h"
 
 #include <cstring>
-#include <limits>
+#include <thread>
 #include <vector>
+#include <unistd.h>
 #include <cucim/cuda_runtime.h>
 #include <cucim/cache/image_cache_manager.h>
 #include <cucim/codec/hash_function.h>
 #include <cucim/io/device.h>
 #include <cucim/util/cuda.h>
 #include <fmt/format.h>
+#include <tiffio.h> // PHOTOMETRIC_RGB
 
 #define ALIGN_UP(x, align_to) (((uint64_t)(x) + ((uint64_t)(align_to)-1)) & ~((uint64_t)(align_to)-1))
 #define ALIGN_DOWN(x, align_to) ((uint64_t)(x) & ~((uint64_t)(align_to)-1))
 namespace cuslide::loader
 {
+
+namespace
+{
+// Interleave three planar 8-bit channels (R, G, B) into a single
+// width*3-pitched interleaved RGB raster. Used for the NATIVE-decode path on
+// RGB-photometric tiles, where rocJPEG returns the components as separate
+// planes and must NOT colour-transform them.
+__global__ void interleave_rgb_planes_kernel(const uint8_t* __restrict__ r,
+                                             const uint8_t* __restrict__ g,
+                                             const uint8_t* __restrict__ b,
+                                             uint32_t src_pitch_r,
+                                             uint32_t src_pitch_g,
+                                             uint32_t src_pitch_b,
+                                             uint8_t* __restrict__ dst,
+                                             size_t dst_pitch,
+                                             uint32_t width,
+                                             uint32_t height)
+{
+    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height)
+        return;
+    uint8_t* out = dst + static_cast<size_t>(y) * dst_pitch + static_cast<size_t>(x) * 3;
+    out[0] = r[static_cast<size_t>(y) * src_pitch_r + x];
+    out[1] = g[static_cast<size_t>(y) * src_pitch_g + x];
+    out[2] = b[static_cast<size_t>(y) * src_pitch_b + x];
+}
+} // namespace
 
 constexpr uint32_t MAX_CUDA_BATCH_SIZE = 1024;
 
@@ -87,10 +117,10 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
         cuda_batch_size_ = cuda_batch_size;
 
-        // NOTE: rocJpegCreate() is deferred until after the file-block backend
-        // decision below, so the rocJPEG handle is created with the final
-        // backend_ value (which may be demoted HARDWARE -> HYBRID when the
-        // requested file span is too large for VRAM).
+        // NOTE: the rocJPEG handle and per-slot stream handles are created at the
+        // end of this constructor, once cuda_batch_size_ is known. The compressed
+        // input is host-resident (see the gather/parse notes below), so there is
+        // no device file-block backend decision and the default backend_ is used.
 
         // Inputs to rocJPEG for decoding
         raw_cuda_inputs_.resize(cuda_batch_size_);
@@ -108,94 +138,47 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         tile_height_ = ifd->tile_height();
         tile_raster_nbytes_ = tile_width_bytes_ * tile_height_;
 
-        // File I/O setup
-        struct stat sb;
-        fstat(file_handle_->fd, &sb);
-        file_size_ = sb.st_size;
-        file_start_offset_ = 0;
-        file_block_size_ = file_size_;
+        // RGB-photometric tiles (e.g. Aperio SVS, Generic TIFF) store JPEG
+        // components that are already R,G,B. ROCJPEG_OUTPUT_RGB would apply a
+        // spurious YCbCr->RGB conversion (corrupting the colours), so for these
+        // we decode NATIVE (no colour transform) and interleave the planes
+        // ourselves. Genuine YCbCr tiles keep the ROCJPEG_OUTPUT_RGB path.
+        decode_native_rgb_ = (ifd->photometric() == PHOTOMETRIC_RGB);
+        output_format_ = decode_native_rgb_ ? ROCJPEG_OUTPUT_NATIVE : ROCJPEG_OUTPUT_RGB;
 
-        // Determines which tiles in the TIFF file cover the requested
-        // region(s), then calculate the corresponding file offset and
-        // the size of the block that must be read to access these tiles'
-        // JPEG streams efficiently.
-        update_file_block_info(request_location, request_size, location_len);
-
-        constexpr int BLOCK_SECTOR_SIZE = 4096;
-
-        // update_file_block_info() sizes file_block_size_ to the contiguous file
-        // span between the first and last requested tile. For a clustered ROI
-        // (a single read_region) that span is small. For a scattered batch
-        // (e.g. random patch sampling across a slide) the first and last tiles
-        // can sit near opposite ends of the file, so the span approaches the
-        // whole slide's tile data (potentially many GB) even though only a few
-        // small tiles inside it are actually needed.
+        // rocJpegStreamParse() parses the JPEG header on the HOST CPU -- it
+        // dereferences the data pointer directly (e.g. the SOI check
+        // `*stream_ != 0xFF` and std::memcpy of the DQT/DHT tables in
+        // rocJpegStreamParser::ParseJpegStream). It therefore requires a HOST
+        // pointer for the compressed input, even for ROCJPEG_BACKEND_HARDWARE.
+        // (rocJPEG's own batched samples read the compressed JPEG into a host
+        // std::vector and pass host .data() to rocJpegStreamParse regardless of
+        // backend; only the decoded OUTPUT is device memory.) So the compressed
+        // tile bytes and the merged-JPEG arena are always host-resident; device
+        // memory is reserved for the decode output only.
         //
-        // The HARDWARE backend mirrors that whole span into device memory with a
-        // single hipMalloc. An unbounded span there can exhaust VRAM and abort
-        // the entire process with hipErrorOutOfMemory (CHECK_HIP calls exit()).
-        // Guard it: if the device block would exceed a fraction of currently-free
-        // VRAM, throw a normal C++ exception instead. That propagates out of
-        // read_region() as a recoverable error (the caller can retry on the CPU
-        // device or with a smaller / more spatially-local batch) rather than
-        // taking down the host process. The common clustered-ROI case is well
-        // under the cap and is unaffected.
-        if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-        {
-            size_t free_vram = 0, total_vram = 0;
-            const size_t needed = file_block_size_ + BLOCK_SECTOR_SIZE;
-            if (hipMemGetInfo(&free_vram, &total_vram) == hipSuccess)
-            {
-                // Leave headroom for the merged-JPEG arena, rocJPEG decode
-                // buffers, and other allocations: cap the file block at half of
-                // the currently-free VRAM.
-                const size_t cap = free_vram / 2;
-                if (needed > cap)
-                {
-                    throw std::runtime_error(fmt::format(
-                        "GPU read_region: the requested tiles span a {:.1f} GB file block, which "
-                        "exceeds the {:.1f} GB VRAM budget for a single batch. The requested "
-                        "locations are spread too far across the slide for the GPU batch path. "
-                        "Retry with device=\"cpu\", a smaller batch_size, or spatially-local "
-                        "locations.",
-                        needed / (1024.0 * 1024.0 * 1024.0), cap / (1024.0 * 1024.0 * 1024.0)));
-                }
-            }
-        }
+        // Tiles are gathered per batch in request() rather than mirroring the
+        // whole [min..max] file span here. A spatially-scattered batch (e.g.
+        // random patch sampling) can span nearly the entire slide, so a single
+        // pread of that span would read hundreds of MB to use a few small
+        // tiles. Instead each request() reads only the tiles it will decode,
+        // in parallel, into a per-batch host tile arena, using the slide's own
+        // buffered file descriptor (file_handle_->fd) -- the same descriptor the
+        // CPU libjpeg path uses, so reads are page-cache-eligible (no O_DIRECT
+        // self-penalty) and positional pread() is thread-safe across tiles.
 
-        switch (backend_)
-        {
-        case ROCJPEG_BACKEND_HYBRID :
-            cufile_ = cucim::filesystem::open(file_handle->path, "rp");
-            unaligned_host_ = static_cast<uint8_t*>(cucim_malloc(file_block_size_ + BLOCK_SECTOR_SIZE * 2));
-            aligned_host_ = reinterpret_cast<uint8_t*>(ALIGN_UP(unaligned_host_, BLOCK_SECTOR_SIZE));
-            cufile_->pread(aligned_host_, file_block_size_, file_start_offset_);
-            break;
-        case ROCJPEG_BACKEND_HARDWARE:
-            cufile_ = cucim::filesystem::open(file_handle->path, "r");
-            CHECK_HIP(hipMalloc(&unaligned_device_, file_block_size_ + BLOCK_SECTOR_SIZE));
-            aligned_device_ = reinterpret_cast<uint8_t*>(ALIGN_UP(unaligned_device_, BLOCK_SECTOR_SIZE));
-            cufile_->pread(aligned_device_, file_block_size_, file_start_offset_);
-            break;
-        default:
-            throw std::runtime_error("Unsupported backend type");
-        }
+        // Per-batch host arena holding the raw compressed bytes of each tile in
+        // the current batch. tile_raster_nbytes_ is a safe upper bound on a
+        // compressed JPEG tile (it never exceeds its uncompressed raster size
+        // in practice); +64 for alignment/safety slack.
+        tile_slot_bytes_ = tile_raster_nbytes_ + 64;
+        tile_arena_host_ = static_cast<uint8_t*>(
+            cucim_malloc(static_cast<size_t>(cuda_batch_size_) * tile_slot_bytes_));
 
-        // Initialize rocJPEG and create handle (with the final backend_ value).
-        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
-
-        // Create stream handles of batch size
-        stream_handles_.resize(cuda_batch_size_);
-        for (uint32_t i = 0; i < cuda_batch_size_; ++i)
-        {
-            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
-        }
-
-        // Allocate the merged-JPEG arena. Each batch slot gets
+        // Allocate the merged-JPEG arena (host). Each batch slot gets
         // merged_slot_bytes_ contiguous bytes; tile_raster_nbytes_ is a safe
-        // upper bound on the compressed JPEG size (a JPEG tile never expands
-        // to more than its uncompressed raster size in practice) plus the
-        // prefix length, plus a small safety margin.
+        // upper bound on the compressed JPEG size plus the prefix length, plus
+        // a small safety margin.
         if (!jpegtable_prefix_host_.empty())
         {
             const size_t prefix_len = jpegtable_prefix_host_.size();
@@ -203,50 +186,35 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
             const size_t arena_bytes = static_cast<size_t>(cuda_batch_size_) * merged_slot_bytes_;
 
-            if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-            {
-                // Device-side prefix (copied once) + device-side per-tile arena.
-                CHECK_HIP(hipMalloc(&jpegtable_prefix_device_, prefix_len));
-                CHECK_HIP(hipMemcpy(jpegtable_prefix_device_, jpegtable_prefix_host_.data(),
-                                    prefix_len, hipMemcpyHostToDevice));
-                CHECK_HIP(hipMalloc(&merged_arena_device_, arena_bytes));
-            }
-            else // HYBRID
-            {
-                merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
-            }
+            merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
+        }
+
+        // Create the rocJPEG decode handle and one stream handle per batch slot.
+        // request() dereferences stream_handles_[i] for each tile and passes
+        // handle_ + stream_handles_.data() to rocJpegDecodeBatched; both must be
+        // initialized here. The compressed input is host-resident (rocJpegStreamParse
+        // reads the JPEG header on the host CPU), so no device file-block backend
+        // decision is needed and the handle is created with the default backend_.
+        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
+
+        stream_handles_.resize(cuda_batch_size_);
+        for (uint32_t i = 0; i < cuda_batch_size_; ++i)
+        {
+            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
         }
     }
 }
 
 RocJpegProcessor::~RocJpegProcessor()
 {
-    // Free any host-mapped memory (Hybrid backend)
-    if (unaligned_host_)
+    // Free the per-batch host tile arena (gathered compressed tile bytes).
+    if (tile_arena_host_)
     {
-        cucim_free(unaligned_host_);
-        unaligned_host_ = nullptr;
+        cucim_free(tile_arena_host_);
+        tile_arena_host_ = nullptr;
     }
 
-    // Free any device memory (Hardware backend)
-    if (unaligned_device_)
-    {
-        CHECK_HIP(hipFree(unaligned_device_));
-        unaligned_device_ = nullptr;
-        aligned_device_ = nullptr;
-    }
-
-    // Free merged-JPEG arena + device-side JPEGTables prefix.
-    if (jpegtable_prefix_device_)
-    {
-        CHECK_HIP(hipFree(jpegtable_prefix_device_));
-        jpegtable_prefix_device_ = nullptr;
-    }
-    if (merged_arena_device_)
-    {
-        CHECK_HIP(hipFree(merged_arena_device_));
-        merged_arena_device_ = nullptr;
-    }
+    // Free the host-resident merged-JPEG arena.
     if (merged_arena_host_)
     {
         cucim_free(merged_arena_host_);
@@ -386,57 +354,89 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
     if (decode_params_.size() < request_count)
         decode_params_.resize(request_count);
 
-    uint8_t* file_block_ptr = nullptr;
-    switch (backend_)
-    {
-    case ROCJPEG_BACKEND_HYBRID:
-        file_block_ptr = aligned_host_;
-        break;
-    case ROCJPEG_BACKEND_HARDWARE:
-        file_block_ptr = aligned_device_;
-        break;
-    default:
-        throw std::runtime_error("Unsupported backend type");
-    }
-
     // Setup inputs, outputs, and decode_params for just as many as request_count
     const bool need_merge = !jpegtable_prefix_host_.empty();
     const size_t prefix_len = jpegtable_prefix_host_.size();
     bool any_parse_failed = false;
 
+    // Phase 1: gather the compressed bytes of every valid tile in this batch in
+    // PARALLEL. Scattered tiles sit at random file offsets, so the per-tile read
+    // is latency-bound; issuing them concurrently overlaps that latency instead
+    // of paying it serially. Positional pread() on the same fd is thread-safe
+    // (no shared seek pointer), and each tile writes a disjoint arena slot, so
+    // no synchronization is needed beyond joining. A tile that is zero-length or
+    // larger than its slot is left unread (marked invalid) so it falls back to
+    // CPU decode instead of overrunning the arena.
+    const int fd = file_handle_->fd;
+    std::vector<uint8_t> tile_valid(request_count, 0);
+    {
+        unsigned int hw = std::thread::hardware_concurrency();
+        size_t n_threads = std::min<size_t>(request_count, hw ? hw : 8);
+        if (n_threads < 1)
+            n_threads = 1;
+        auto read_range = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i)
+            {
+                const size_t tsize = tile_to_request[i].size;
+                if (tsize == 0 || tsize > tile_slot_bytes_)
+                    continue; // leave invalid -> CPU fallback
+                uint8_t* dst = tile_arena_host_ + (i * tile_slot_bytes_);
+                size_t got = 0;
+                const off_t base = static_cast<off_t>(tile_to_request[i].offset);
+                while (got < tsize)
+                {
+                    ssize_t r = ::pread(fd, dst + got, tsize - got, base + static_cast<off_t>(got));
+                    if (r <= 0)
+                        break;
+                    got += static_cast<size_t>(r);
+                }
+                if (got == tsize)
+                    tile_valid[i] = 1;
+            }
+        };
+        if (n_threads <= 1)
+        {
+            read_range(0, request_count);
+        }
+        else
+        {
+            std::vector<std::thread> pool;
+            pool.reserve(n_threads);
+            const size_t chunk = (request_count + n_threads - 1) / n_threads;
+            for (size_t t = 0; t < n_threads; ++t)
+            {
+                const size_t b = t * chunk;
+                if (b >= request_count)
+                    break;
+                const size_t e = std::min(request_count, b + chunk);
+                pool.emplace_back(read_range, b, e);
+            }
+            for (auto& th : pool)
+                th.join();
+        }
+    }
+
+    // Phase 2: merge (splice JPEGTables prefix) + parse, reading from the bytes
+    // already gathered in phase 1.
     for (size_t i = 0; i < request_count; ++i)
     {
-        const uint64_t tile_offset = tile_to_request[i].offset;
         const size_t tile_size = tile_to_request[i].size;
-
-        // Defense in depth: the file block is sized in update_file_block_info()
-        // to contain every covered tile, but never trust the offset blindly --
-        // a tile whose [offset, offset+size) falls outside the mirrored block
-        // would make the pointer arithmetic below underflow and dereference
-        // wild memory. Treat such a tile as a parse failure (zero-length input
-        // => zero-size cache value => the caller's CPU fallback path decodes
-        // it) instead of crashing the process. The output buffer is still
-        // allocated below so the cache-insertion memcpy has a valid source.
-        const bool tile_in_block =
-            (tile_offset >= file_start_offset_) &&
-            (tile_offset + tile_size <= file_start_offset_ + file_block_size_);
 
         const unsigned char* input_ptr = nullptr;
         size_t input_len = 0;
 
-        if (!tile_in_block)
+        if (!tile_valid[i])
         {
-            std::cerr << "**warning**: tile " << i << " (offset " << tile_offset
-                      << ", size " << tile_size << ") falls outside the mirrored file block ["
-                      << file_start_offset_ << ", " << (file_start_offset_ + file_block_size_)
-                      << "); skipping GPU decode for this tile" << std::endl;
+            std::cerr << "**warning**: tile " << i << " (size " << tile_size
+                      << ") is zero/oversized or its read was short"
+                      << "; skipping GPU decode for this tile" << std::endl;
             raw_cuda_inputs_.push_back(nullptr);
             raw_cuda_inputs_len_.push_back(0);
             any_parse_failed = true;
         }
         else
         {
-            uint8_t* tile_mem_offset = file_block_ptr + tile_offset - file_start_offset_;
+            uint8_t* tile_mem_offset = tile_arena_host_ + (i * tile_slot_bytes_);
 
             // For SVS / TIFF abbreviated-JPEG tiles, splice the
             // IFD's JPEGTables prefix into a per-slot merged buffer so the
@@ -456,26 +456,15 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
                 : 0;
             if (merged_len > 0)
             {
-                if (backend_ == ROCJPEG_BACKEND_HARDWARE)
-                {
-                    uint8_t* slot = merged_arena_device_ + (i * merged_slot_bytes_);
-                    // prefix: device→device (pre-copied at construction)
-                    CHECK_HIP(hipMemcpy(slot, jpegtable_prefix_device_,
-                                        prefix_len, hipMemcpyDeviceToDevice));
-                    // tile body (skip 2-byte SOI): device→device
-                    CHECK_HIP(hipMemcpy(slot + prefix_len, tile_mem_offset + 2,
-                                        tile_size - 2, hipMemcpyDeviceToDevice));
-                    input_ptr = slot;
-                }
-                else // HYBRID — everything is on host
-                {
-                    uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
-                    detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
-                                                    prefix_len,
-                                                    tile_mem_offset, tile_size,
-                                                    slot);
-                    input_ptr = slot;
-                }
+                // Splice [JPEGTables prefix] ++ [tile after SOI] into a host
+                // slot. The merged buffer is what rocJpegStreamParse reads, so
+                // it must be host memory for every backend.
+                uint8_t* slot = merged_arena_host_ + (i * merged_slot_bytes_);
+                detail::splice_jpegtable_prefix(jpegtable_prefix_host_.data(),
+                                                prefix_len,
+                                                tile_mem_offset, tile_size,
+                                                slot);
+                input_ptr = slot;
                 input_len = merged_len;
             }
 
@@ -514,20 +503,41 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         decode_params_[i].crop_rectangle = {0, 0, 0, 0}; // No cropping by default
         decode_params_[i].target_dimension = {0, 0};     // No resizing by default
 
-        // Allocate output buffer if not allocated or wrong size
-        size_t expected_pitch = tile_width_bytes_;
-        size_t expected_bytes = expected_pitch * tile_height_;
-
-        if (!raw_cuda_outputs_[i].channel[0] ||
-            raw_cuda_outputs_[i].pitch[0] != expected_pitch)
+        // Allocate output buffer(s).
+        if (decode_native_rgb_)
         {
-            if (raw_cuda_outputs_[i].channel[0])
-                hipFree(raw_cuda_outputs_[i].channel[0]);
+            // NATIVE decode returns three separate width-wide planes (one per
+            // component). Allocate channel[0..2], each tile_width_ bytes wide.
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                if (!raw_cuda_outputs_[i].channel[ch] ||
+                    raw_cuda_outputs_[i].pitch[ch] != tile_width_)
+                {
+                    if (raw_cuda_outputs_[i].channel[ch])
+                        hipFree(raw_cuda_outputs_[i].channel[ch]);
 
-            CHECK_HIP(hipMallocPitch(
-                reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[0]),
-                reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[0]),
-                tile_width_bytes_, tile_height_));
+                    CHECK_HIP(hipMallocPitch(
+                        reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[ch]),
+                        reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[ch]),
+                        tile_width_, tile_height_));
+                }
+            }
+        }
+        else
+        {
+            // ROCJPEG_OUTPUT_RGB returns a single interleaved width*3 raster.
+            size_t expected_pitch = tile_width_bytes_;
+            if (!raw_cuda_outputs_[i].channel[0] ||
+                raw_cuda_outputs_[i].pitch[0] != expected_pitch)
+            {
+                if (raw_cuda_outputs_[i].channel[0])
+                    hipFree(raw_cuda_outputs_[i].channel[0]);
+
+                CHECK_HIP(hipMallocPitch(
+                    reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[0]),
+                    reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[0]),
+                    tile_width_bytes_, tile_height_));
+            }
         }
     }
 
@@ -580,13 +590,36 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         uint8_t* tile_data = static_cast<uint8_t*>(cuda_image_cache_->allocate(tile_raster_nbytes_));
 
         cudaError_t cuda_status;
-        CUDA_TRY(
-            cudaMemcpy2D(tile_data, tile_width_bytes_,
-                         raw_cuda_outputs_[i].channel[0],
-                         raw_cuda_outputs_[i].pitch[0],
-                         tile_width_bytes_, tile_height_,
-                         cudaMemcpyDeviceToDevice)
-        );
+        if (decode_native_rgb_)
+        {
+            // NATIVE decode gave three R,G,B planes (no colour transform).
+            // Interleave them into the cache's width*3 raster.
+            dim3 block(16, 16);
+            dim3 grid((static_cast<uint32_t>(tile_width_) + block.x - 1) / block.x,
+                      (static_cast<uint32_t>(tile_height_) + block.y - 1) / block.y);
+            hipLaunchKernelGGL(interleave_rgb_planes_kernel, grid, block, 0, 0,
+                               raw_cuda_outputs_[i].channel[0],
+                               raw_cuda_outputs_[i].channel[1],
+                               raw_cuda_outputs_[i].channel[2],
+                               raw_cuda_outputs_[i].pitch[0],
+                               raw_cuda_outputs_[i].pitch[1],
+                               raw_cuda_outputs_[i].pitch[2],
+                               tile_data, tile_width_bytes_,
+                               static_cast<uint32_t>(tile_width_),
+                               static_cast<uint32_t>(tile_height_));
+            CHECK_HIP(hipGetLastError());
+            CHECK_HIP(hipDeviceSynchronize());
+        }
+        else
+        {
+            CUDA_TRY(
+                cudaMemcpy2D(tile_data, tile_width_bytes_,
+                             raw_cuda_outputs_[i].channel[0],
+                             raw_cuda_outputs_[i].pitch[0],
+                             tile_width_bytes_, tile_height_,
+                             cudaMemcpyDeviceToDevice)
+            );
+        }
 
         const size_t tile_raster_nbytes = raw_cuda_inputs_len_[i];
         auto value = cuda_image_cache_->create_value(tile_data, tile_raster_nbytes, cucim::io::DeviceType::kCUDA);
@@ -644,99 +677,6 @@ void RocJpegProcessor::shutdown()
 uint32_t RocJpegProcessor::preferred_loader_prefetch_factor()
 {
     return preferred_loader_prefetch_factor_;
-}
-
-// Compute which tiles are needed to cover the requested region(s).
-// Sets file_start_offset_ and file_block_size_ to contain all those
-// tiles' JPEG data for efficient single-block I/O, minimizing system
-// calls and file reads, which is especially important for large slides.
-void RocJpegProcessor::update_file_block_info(const int64_t* request_location,
-                                              const int64_t* request_size,
-                                              const uint64_t location_len)
-{
-    uint32_t width = ifd_->width();
-    uint32_t height = ifd_->height();
-    uint32_t stride_y = width / tile_width_ + !!(width % tile_width_); // # of tiles in a row(y) in the ifd tile array
-                                                                       // as grid (horizontal tile count)
-    uint32_t stride_x = height / tile_height_ + !!(height % tile_height_); // # of tiles in a col(x) in the ifd tile
-                                                                           // array as grid (vertical tile count)
-
-    // Max/min for finding the tile index range covering the requested region(s)
-    int64_t min_tile_index = 1000000000;
-    int64_t max_tile_index = 0;
-
-    // For each requested ROI, compute the upper-left tile index covering that location.
-    // Update the min and max tile indices, in case multiple ROIs are specified.
-    // (Assume that offset for tiles are increasing as the index is increasing)
-    for (size_t loc_index = 0; loc_index < location_len; ++loc_index)
-    {
-        int64_t sx = request_location[loc_index * 2];
-        int64_t sy = request_location[loc_index * 2 + 1];
-        int64_t offset_sx = static_cast<uint64_t>(sx) / tile_width_; // x-axis start offset for the requested region in
-                                                                     // the ifd tile array as grid
-        int64_t offset_sy = static_cast<uint64_t>(sy) / tile_height_; // y-axis start offset for the requested region in
-                                                                      // the ifd tile array as grid
-        int64_t tile_index = (offset_sy * stride_y) + offset_sx;
-        min_tile_index = std::min(min_tile_index, tile_index);
-        max_tile_index = std::max(max_tile_index, tile_index);
-    }
-
-    // Requested ROI size
-    int64_t w = request_size[0];
-    int64_t h = request_size[1];
-
-    // Calculate how many tiles along x and y are needed to cover the
-    // ROI's full extent.
-    // Update max_tile_index to ensure the entire requested patch plus
-    // its width/height (potentially covering more tiles) are included.
-    int64_t additional_index_x = (static_cast<uint64_t>(w) + (tile_width_ - 1)) / tile_width_;
-    int64_t additional_index_y = (static_cast<uint64_t>(h) + (tile_height_ - 1)) / tile_height_;
-    max_tile_index += (additional_index_y * stride_y) + additional_index_x;
-
-    // Retrieve the file offsets for the JPEG tiles that need to be read.
-    auto& image_piece_offsets = const_cast<std::vector<uint64_t>&>(ifd_->image_piece_offsets());
-    auto& image_piece_bytecounts = const_cast<std::vector<uint64_t>&>(ifd_->image_piece_bytecounts());
-    const int64_t tile_count = static_cast<int64_t>(image_piece_offsets.size());
-
-    // Clamp the covered index range to the valid tile array bounds. BOTH ends
-    // must be clamped: a request whose location maps to an index >= tile_count
-    // (e.g. an out-of-bounds or transposed coordinate) would otherwise index
-    // image_piece_offsets[] out of range and crash the host process.
-    min_tile_index = std::max<int64_t>(min_tile_index, 0);
-    max_tile_index = std::min<int64_t>(max_tile_index, tile_count - 1);
-    if (tile_count == 0 || min_tile_index > max_tile_index)
-    {
-        // No valid tiles cover the request; leave the (file_size_) defaults so
-        // the caller's CPU fallback path can take over without a wild read.
-        return;
-    }
-
-    // The tile index range is contiguous, but a TIFF/SVS file does NOT
-    // guarantee that a tile's file offset increases monotonically with its
-    // index (SVS in particular interleaves tile data). Deriving the block
-    // bounds from only image_piece_offsets[min_index] / [max_index] therefore
-    // does not necessarily bracket every covered tile's bytes. request() later
-    // addresses each tile as (file_block_base + tile.offset - file_start_offset_),
-    // so if a covered tile's offset falls outside [file_start_offset_,
-    // file_start_offset_ + file_block_size_) that pointer arithmetic underflows
-    // and dereferences wild memory -> SIGSEGV.
-    //
-    // Scan the actual offsets/bytecounts across the covered index range and take
-    // the true min start and max end so the block provably contains every tile.
-    uint64_t min_offset = std::numeric_limits<uint64_t>::max();
-    uint64_t max_offset = 0;
-    for (int64_t idx = min_tile_index; idx <= max_tile_index; ++idx)
-    {
-        const uint64_t off = image_piece_offsets[idx];
-        const uint64_t end = off + image_piece_bytecounts[idx];
-        min_offset = std::min(min_offset, off);
-        max_offset = std::max(max_offset, end);
-    }
-
-    // Start offset and size of the file block to be read, covering
-    // the requested tiles.
-    file_start_offset_ = min_offset;
-    file_block_size_ = max_offset - min_offset + 1;
 }
 
 } // namespace cuslide::loader
