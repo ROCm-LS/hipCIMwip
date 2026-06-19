@@ -88,10 +88,10 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
 
         cuda_batch_size_ = cuda_batch_size;
 
-        // NOTE: rocJpegCreate() is deferred until after the file-block backend
-        // decision below, so the rocJPEG handle is created with the final
-        // backend_ value (which may be demoted HARDWARE -> HYBRID when the
-        // requested file span is too large for VRAM).
+        // NOTE: the rocJPEG handle and per-slot stream handles are created at the
+        // end of this constructor, once cuda_batch_size_ is known. The compressed
+        // input is host-resident (see the gather/parse notes below), so there is
+        // no device file-block backend decision and the default backend_ is used.
 
         // Inputs to rocJPEG for decoding
         raw_cuda_inputs_.resize(cuda_batch_size_);
@@ -150,6 +150,20 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
             const size_t arena_bytes = static_cast<size_t>(cuda_batch_size_) * merged_slot_bytes_;
 
             merged_arena_host_ = static_cast<uint8_t*>(cucim_malloc(arena_bytes));
+        }
+
+        // Create the rocJPEG decode handle and one stream handle per batch slot.
+        // request() dereferences stream_handles_[i] for each tile and passes
+        // handle_ + stream_handles_.data() to rocJpegDecodeBatched; both must be
+        // initialized here. The compressed input is host-resident (rocJpegStreamParse
+        // reads the JPEG header on the host CPU), so no device file-block backend
+        // decision is needed and the handle is created with the default backend_.
+        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
+
+        stream_handles_.resize(cuda_batch_size_);
+        for (uint32_t i = 0; i < cuda_batch_size_; ++i)
+        {
+            CHECK_ROCJPEG(rocJpegStreamCreate(&stream_handles_[i]));
         }
     }
 }
