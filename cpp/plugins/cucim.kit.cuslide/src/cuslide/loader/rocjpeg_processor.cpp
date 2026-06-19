@@ -404,6 +404,19 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
 
         if (cache_tile_map_.find(index) == cache_tile_map_.end() && tile.size > 0)
         {
+            // Cross-call reuse: if this tile was already decoded by a previous
+            // read_region() and still lives in the process-level GPU tile cache,
+            // skip decoding it. The consumer's wait_for_processing() looks the
+            // tile up in the same cache by (ifd_hash, index) and finds it
+            // directly, so no decode/insert is needed here. This is what turns
+            // the process-level cache into an actual decode-skip on repeated /
+            // overlapping reads (e.g. multi-epoch training).
+            auto cached_key = cuda_image_cache_->create_key(ifd_->hash_value(), index);
+            if (cuda_image_cache_->find(cached_key))
+            {
+                continue;
+            }
+
             cache_tile_queue_.emplace_back(index);
             cache_tile_map_.emplace(index, tile);
             tile_to_request.emplace_back(tile);
