@@ -96,10 +96,12 @@ private:
     std::deque<uint32_t> cache_tile_queue_;
     std::unordered_map<uint32_t, cucim::loader::TileInfo> cache_tile_map_;
 
+    // The compressed file block is always host-resident: rocJpegStreamParse
+    // reads the JPEG header on the host CPU and therefore needs a host pointer
+    // for the input even with ROCJPEG_BACKEND_HARDWARE. Device memory is used
+    // only for the decoded output (raw_cuda_outputs_).
     uint8_t* unaligned_host_ = nullptr;
     uint8_t* aligned_host_ = nullptr;
-    uint8_t* unaligned_device_ = nullptr;
-    uint8_t* aligned_device_ = nullptr;
 
     std::vector<const unsigned char*> raw_cuda_inputs_;
     std::vector<size_t> raw_cuda_inputs_len_;
@@ -117,17 +119,14 @@ private:
     //   merged = jpegtable[0 .. size-2)  ++  tile[2 .. tile_size)
     //          = [SOI][DQT/DHT...]       ++  [...SOS][scan][EOI]
     //
-    // jpegtable_prefix_host_  : host copy of jpegtable[0..size-2]
-    // jpegtable_prefix_device_: same bytes pre-copied to device memory
-    //                           (allocated only for ROCJPEG_BACKEND_HARDWARE)
-    // merged_arena_{host,device}_: single contiguous arena sliced into
-    //                           cuda_batch_size_ slots of merged_slot_bytes_
-    //                           each, so per-batch allocation cost is paid
-    //                           once at construction.
+    // jpegtable_prefix_host_ : host copy of jpegtable[0..size-2]
+    // merged_arena_host_     : single contiguous HOST arena sliced into
+    //                          cuda_batch_size_ slots of merged_slot_bytes_
+    //                          each, so per-batch allocation cost is paid once
+    //                          at construction. Host-resident because the
+    //                          merged stream is what rocJpegStreamParse reads.
     std::vector<uint8_t> jpegtable_prefix_host_;
-    uint8_t* jpegtable_prefix_device_ = nullptr;
     uint8_t* merged_arena_host_ = nullptr;
-    uint8_t* merged_arena_device_ = nullptr;
     size_t merged_slot_bytes_ = 0;
 };
 } // namespace cuslide::loader
