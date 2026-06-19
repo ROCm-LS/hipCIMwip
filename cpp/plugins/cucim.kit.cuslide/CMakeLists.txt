@@ -213,6 +213,37 @@ set_source_files_properties(src/cuslide/jpeg/libjpeg_turbo.cpp
         COMPILE_OPTIONS "-Wno-error" # or, "-Wno-write-strings;-Wno-clobbered"
     )
 
+# rocjpeg_processor.cpp contains a HIP __global__ kernel (RGB plane interleave).
+# This target is plain C/CXX compiled with hipcc, so hipcc would otherwise emit
+# device code only for its built-in default arch (gfx906) regardless of
+# AMDGPU_TARGETS — and the kernel launch then fails at runtime with
+# "No compatible code objects found" on gfx942/gfx950. Pass --offload-arch
+# explicitly for the requested GPU target(s) on just this source file.
+if(DEFINED GPU_TARGETS AND GPU_TARGETS)
+    set(_CUSLIDE_GPU_TARGETS "${GPU_TARGETS}")
+elseif(DEFINED AMDGPU_TARGETS AND AMDGPU_TARGETS)
+    set(_CUSLIDE_GPU_TARGETS "${AMDGPU_TARGETS}")
+elseif(DEFINED ENV{GPU_TARGETS} AND NOT "$ENV{GPU_TARGETS}" STREQUAL "")
+    set(_CUSLIDE_GPU_TARGETS "$ENV{GPU_TARGETS}")
+elseif(DEFINED ENV{AMDGPU_TARGETS} AND NOT "$ENV{AMDGPU_TARGETS}" STREQUAL "")
+    set(_CUSLIDE_GPU_TARGETS "$ENV{AMDGPU_TARGETS}")
+else()
+    set(_CUSLIDE_GPU_TARGETS "gfx942;gfx950")
+endif()
+# Accept either ';' or ',' separated lists.
+string(REPLACE "," ";" _CUSLIDE_GPU_TARGETS "${_CUSLIDE_GPU_TARGETS}")
+set(_CUSLIDE_OFFLOAD_FLAGS "")
+foreach(_arch IN LISTS _CUSLIDE_GPU_TARGETS)
+    if(_arch)
+        list(APPEND _CUSLIDE_OFFLOAD_FLAGS "--offload-arch=${_arch}")
+    endif()
+endforeach()
+message(STATUS "cuslide: rocjpeg_processor.cpp HIP offload archs: ${_CUSLIDE_OFFLOAD_FLAGS}")
+set_source_files_properties(src/cuslide/loader/rocjpeg_processor.cpp
+    PROPERTIES
+        COMPILE_OPTIONS "${_CUSLIDE_OFFLOAD_FLAGS}"
+    )
+
 # Compile options
 set_target_properties(${CUCIM_PLUGIN_NAME}
     PROPERTIES
