@@ -14,11 +14,40 @@
 #include <cucim/io/device.h>
 #include <cucim/util/cuda.h>
 #include <fmt/format.h>
+#include <tiffio.h> // PHOTOMETRIC_RGB
 
 #define ALIGN_UP(x, align_to) (((uint64_t)(x) + ((uint64_t)(align_to)-1)) & ~((uint64_t)(align_to)-1))
 #define ALIGN_DOWN(x, align_to) ((uint64_t)(x) & ~((uint64_t)(align_to)-1))
 namespace cuslide::loader
 {
+
+namespace
+{
+// Interleave three planar 8-bit channels (R, G, B) into a single
+// width*3-pitched interleaved RGB raster. Used for the NATIVE-decode path on
+// RGB-photometric tiles, where rocJPEG returns the components as separate
+// planes and must NOT colour-transform them.
+__global__ void interleave_rgb_planes_kernel(const uint8_t* __restrict__ r,
+                                             const uint8_t* __restrict__ g,
+                                             const uint8_t* __restrict__ b,
+                                             uint32_t src_pitch_r,
+                                             uint32_t src_pitch_g,
+                                             uint32_t src_pitch_b,
+                                             uint8_t* __restrict__ dst,
+                                             size_t dst_pitch,
+                                             uint32_t width,
+                                             uint32_t height)
+{
+    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height)
+        return;
+    uint8_t* out = dst + static_cast<size_t>(y) * dst_pitch + static_cast<size_t>(x) * 3;
+    out[0] = r[static_cast<size_t>(y) * src_pitch_r + x];
+    out[1] = g[static_cast<size_t>(y) * src_pitch_g + x];
+    out[2] = b[static_cast<size_t>(y) * src_pitch_b + x];
+}
+} // namespace
 
 constexpr uint32_t MAX_CUDA_BATCH_SIZE = 1024;
 
@@ -108,6 +137,14 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         tile_width_bytes_ = tile_width_ * ifd->pixel_size_nbytes();
         tile_height_ = ifd->tile_height();
         tile_raster_nbytes_ = tile_width_bytes_ * tile_height_;
+
+        // RGB-photometric tiles (e.g. Aperio SVS, Generic TIFF) store JPEG
+        // components that are already R,G,B. ROCJPEG_OUTPUT_RGB would apply a
+        // spurious YCbCr->RGB conversion (corrupting the colours), so for these
+        // we decode NATIVE (no colour transform) and interleave the planes
+        // ourselves. Genuine YCbCr tiles keep the ROCJPEG_OUTPUT_RGB path.
+        decode_native_rgb_ = (ifd->photometric() == PHOTOMETRIC_RGB);
+        output_format_ = decode_native_rgb_ ? ROCJPEG_OUTPUT_NATIVE : ROCJPEG_OUTPUT_RGB;
 
         // rocJpegStreamParse() parses the JPEG header on the HOST CPU -- it
         // dereferences the data pointer directly (e.g. the SOI check
@@ -466,20 +503,41 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         decode_params_[i].crop_rectangle = {0, 0, 0, 0}; // No cropping by default
         decode_params_[i].target_dimension = {0, 0};     // No resizing by default
 
-        // Allocate output buffer if not allocated or wrong size
-        size_t expected_pitch = tile_width_bytes_;
-        size_t expected_bytes = expected_pitch * tile_height_;
-
-        if (!raw_cuda_outputs_[i].channel[0] ||
-            raw_cuda_outputs_[i].pitch[0] != expected_pitch)
+        // Allocate output buffer(s).
+        if (decode_native_rgb_)
         {
-            if (raw_cuda_outputs_[i].channel[0])
-                hipFree(raw_cuda_outputs_[i].channel[0]);
+            // NATIVE decode returns three separate width-wide planes (one per
+            // component). Allocate channel[0..2], each tile_width_ bytes wide.
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                if (!raw_cuda_outputs_[i].channel[ch] ||
+                    raw_cuda_outputs_[i].pitch[ch] != tile_width_)
+                {
+                    if (raw_cuda_outputs_[i].channel[ch])
+                        hipFree(raw_cuda_outputs_[i].channel[ch]);
 
-            CHECK_HIP(hipMallocPitch(
-                reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[0]),
-                reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[0]),
-                tile_width_bytes_, tile_height_));
+                    CHECK_HIP(hipMallocPitch(
+                        reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[ch]),
+                        reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[ch]),
+                        tile_width_, tile_height_));
+                }
+            }
+        }
+        else
+        {
+            // ROCJPEG_OUTPUT_RGB returns a single interleaved width*3 raster.
+            size_t expected_pitch = tile_width_bytes_;
+            if (!raw_cuda_outputs_[i].channel[0] ||
+                raw_cuda_outputs_[i].pitch[0] != expected_pitch)
+            {
+                if (raw_cuda_outputs_[i].channel[0])
+                    hipFree(raw_cuda_outputs_[i].channel[0]);
+
+                CHECK_HIP(hipMallocPitch(
+                    reinterpret_cast<void**>(&raw_cuda_outputs_[i].channel[0]),
+                    reinterpret_cast<size_t*>(&raw_cuda_outputs_[i].pitch[0]),
+                    tile_width_bytes_, tile_height_));
+            }
         }
     }
 
@@ -532,13 +590,36 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         uint8_t* tile_data = static_cast<uint8_t*>(cuda_image_cache_->allocate(tile_raster_nbytes_));
 
         cudaError_t cuda_status;
-        CUDA_TRY(
-            cudaMemcpy2D(tile_data, tile_width_bytes_,
-                         raw_cuda_outputs_[i].channel[0],
-                         raw_cuda_outputs_[i].pitch[0],
-                         tile_width_bytes_, tile_height_,
-                         cudaMemcpyDeviceToDevice)
-        );
+        if (decode_native_rgb_)
+        {
+            // NATIVE decode gave three R,G,B planes (no colour transform).
+            // Interleave them into the cache's width*3 raster.
+            dim3 block(16, 16);
+            dim3 grid((static_cast<uint32_t>(tile_width_) + block.x - 1) / block.x,
+                      (static_cast<uint32_t>(tile_height_) + block.y - 1) / block.y);
+            hipLaunchKernelGGL(interleave_rgb_planes_kernel, grid, block, 0, 0,
+                               raw_cuda_outputs_[i].channel[0],
+                               raw_cuda_outputs_[i].channel[1],
+                               raw_cuda_outputs_[i].channel[2],
+                               raw_cuda_outputs_[i].pitch[0],
+                               raw_cuda_outputs_[i].pitch[1],
+                               raw_cuda_outputs_[i].pitch[2],
+                               tile_data, tile_width_bytes_,
+                               static_cast<uint32_t>(tile_width_),
+                               static_cast<uint32_t>(tile_height_));
+            CHECK_HIP(hipGetLastError());
+            CHECK_HIP(hipDeviceSynchronize());
+        }
+        else
+        {
+            CUDA_TRY(
+                cudaMemcpy2D(tile_data, tile_width_bytes_,
+                             raw_cuda_outputs_[i].channel[0],
+                             raw_cuda_outputs_[i].pitch[0],
+                             tile_width_bytes_, tile_height_,
+                             cudaMemcpyDeviceToDevice)
+            );
+        }
 
         const size_t tile_raster_nbytes = raw_cuda_inputs_len_[i];
         auto value = cuda_image_cache_->create_value(tile_data, tile_raster_nbytes, cucim::io::DeviceType::kCUDA);
