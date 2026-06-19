@@ -609,7 +609,7 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
         uint32_t index = added_tile.index;
         uint64_t index_hash = cucim::codec::splitmix64(index);
 
-        auto key = cuda_image_cache_->create_key(ifd_->hash_value_, index);
+        auto key = cuda_image_cache_->create_key(ifd_->hash_value(), index);
 
         cuda_image_cache_->lock(index_hash);
 
@@ -687,7 +687,7 @@ std::shared_ptr<cucim::cache::ImageCacheValue> RocJpegProcessor::wait_for_proces
             value = std::shared_ptr<cucim::cache::ImageCacheValue>();
             return true;
         }
-        auto key = cuda_image_cache_->create_key(ifd_->hash_value_, index);
+        auto key = cuda_image_cache_->create_key(ifd_->hash_value(), index);
         value = cuda_image_cache_->find(key);
         return static_cast<bool>(value);
     });
