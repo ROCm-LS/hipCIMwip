@@ -78,6 +78,12 @@ private:
 
     RocJpegStreamHandle handle_ = nullptr;
     RocJpegOutputFormat output_format_ = ROCJPEG_OUTPUT_RGB;
+    // Aperio/Generic RGB-photometric tiles store JPEG components that are already
+    // R,G,B (not YCbCr). ROCJPEG_OUTPUT_RGB unconditionally applies a YCbCr->RGB
+    // matrix, which corrupts genuine-RGB data. For those IFDs we decode NATIVE
+    // (no colour transform) and interleave the three planes ourselves. YCbCr
+    // tiles keep the standard ROCJPEG_OUTPUT_RGB path.
+    bool decode_native_rgb_ = false;
     RocJpegStatus state_;
     RocJpegBackend backend_ = ROCJPEG_BACKEND_HARDWARE;
     hipStream_t stream_ = nullptr;
