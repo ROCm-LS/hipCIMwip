@@ -5,6 +5,7 @@
 #include "rocjpeg_jpegtables.h"
 
 #include <cstring>
+#include <iostream>
 #include <thread>
 #include <vector>
 #include <unistd.h>
@@ -221,7 +222,10 @@ RocJpegProcessor::~RocJpegProcessor()
         merged_arena_host_ = nullptr;
     }
 
-    // Release output buffers for each batch and channel
+    // Release output buffers for each batch and channel.
+    // NOTE: best-effort, non-throwing cleanup only. PrintError now throws, and
+    // CHECK_HIP/CHECK_ROCJPEG route through it; throwing from a destructor would
+    // call std::terminate(). Ignore teardown errors instead.
     for (uint32_t i = 0; i < cuda_batch_size_; ++i)
     {
         for (int ch = 0; ch < ROCJPEG_MAX_COMPONENT; ++ch)
@@ -229,7 +233,7 @@ RocJpegProcessor::~RocJpegProcessor()
             if (raw_cuda_outputs_[i].channel[ch])
             {
                 // Free CUDA memory for each channel buffer
-                CHECK_HIP(hipFree(raw_cuda_outputs_[i].channel[ch]));
+                (void)hipFree(raw_cuda_outputs_[i].channel[ch]);
                 raw_cuda_outputs_[i].channel[ch] = nullptr;
             }
         }
@@ -238,7 +242,7 @@ RocJpegProcessor::~RocJpegProcessor()
     // Destroy rocJPEG stream handles
     for (auto& stream : stream_handles_)
     {
-        CHECK_ROCJPEG(rocJpegStreamDestroy(stream));
+        (void)rocJpegStreamDestroy(stream);
         stream = nullptr;
     }
     stream_handles_.clear();
@@ -246,7 +250,7 @@ RocJpegProcessor::~RocJpegProcessor()
     // Destroy the rocJPEG handle
     if (handle_)
     {
-        CHECK_ROCJPEG(rocJpegDestroy(handle_));
+        (void)rocJpegDestroy(handle_);
         handle_ = nullptr;
     }
 
@@ -481,9 +485,9 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
 #endif // !NDEBUG
 
             // Each tile must have a valid RocJpegStreamHandle.
-            // Do NOT use CHECK_ROCJPEG (which exit(1)s) — we want to fall
+            // Do NOT use CHECK_ROCJPEG (which throws) — we want to fall
             // through to a CPU fallback path on BAD_JPEG so a single bad tile
-            // can't take down the whole process.
+            // can't abort the whole batch.
             RocJpegStatus s = rocJpegStreamParse(raw_cuda_inputs_[i],
                                                  raw_cuda_inputs_len_[i],
                                                  stream_handles_[i]);
@@ -545,8 +549,8 @@ uint32_t RocJpegProcessor::request(std::deque<uint32_t>& batch_item_counts, cons
     // rocJpegDecodeBatched (it would either fail outright or produce
     // garbage for the bad slot); the caller treats missing cache entries
     // as misses and the IFD::read_region CPU fallback path takes over.
-    // Use soft status check (not CHECK_ROCJPEG, which exit(1)s) so a
-    // single corrupt tile cannot take down the whole process.
+    // Use soft status check (not CHECK_ROCJPEG, which throws) so a
+    // single corrupt tile cannot abort the whole batch.
     if (!any_parse_failed)
     {
         RocJpegStatus s = rocJpegDecodeBatched(handle_, stream_handles_.data(),
