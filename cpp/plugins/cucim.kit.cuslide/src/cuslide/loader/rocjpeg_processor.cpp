@@ -75,6 +75,61 @@ static std::shared_ptr<cucim::cache::ImageCache>& s_gpu_tile_cache()
     return *cache;
 }
 
+// Process-level pool of rocJPEG decode handles.
+//
+// A new RocJpegProcessor is constructed for every read_region() call, and
+// rocJpegCreate()/rocJpegDestroy() are among the most expensive rocJPEG calls
+// (they bring up the VCN decode context). For small reads (e.g. a single 256px
+// patch = ~4 tiles) this per-call handle setup dominates wall time, making the
+// GPU path slower than CPU. The handle is independent of tile geometry and
+// batch size -- it only depends on the backend -- so a single pooled handle can
+// be reused across all read_region() calls.
+//
+// Pooled handles are intentionally never destroyed at process exit (calling
+// rocJpegDestroy in a static destructor after the runtime is torn down would
+// crash); the OS reclaims everything at exit.
+class RocJpegHandlePool
+{
+public:
+    static RocJpegHandlePool& instance()
+    {
+        static RocJpegHandlePool* pool = new RocJpegHandlePool();
+        return *pool;
+    }
+
+    // Acquire an idle handle for the given backend, or create one on miss.
+    RocJpegStreamHandle acquire(RocJpegBackend backend)
+    {
+        {
+            std::lock_guard<std::mutex> g(mutex_);
+            auto it = idle_.find(backend);
+            if (it != idle_.end() && !it->second.empty())
+            {
+                RocJpegStreamHandle h = it->second.back();
+                it->second.pop_back();
+                return h;
+            }
+        }
+        // Miss: create outside the lock.
+        RocJpegStreamHandle h = nullptr;
+        CHECK_ROCJPEG(rocJpegCreate(backend, 0, &h));
+        return h;
+    }
+
+    // Return a handle to the pool for reuse (does NOT destroy it).
+    void release(RocJpegBackend backend, RocJpegStreamHandle h)
+    {
+        if (h == nullptr)
+            return;
+        std::lock_guard<std::mutex> g(mutex_);
+        idle_[backend].push_back(h);
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<int, std::vector<RocJpegStreamHandle>> idle_;
+};
+
 RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
                                  const cuslide::tiff::IFD* ifd,
                                  const int64_t* request_location,
@@ -218,13 +273,17 @@ RocJpegProcessor::RocJpegProcessor(CuCIMFileHandle* file_handle,
         }
 
         // Create the rocJPEG decode handle and one stream handle per batch slot.
+        // Acquire the rocJPEG decode handle from the process-level pool (creates
+        // one on a cold miss, reuses an idle one otherwise). rocJpegCreate is
+        // expensive and geometry-independent, so reusing it across read_region()
+        // calls removes the per-call setup that dominates small reads. The handle
+        // is returned to the pool (not destroyed) in the destructor.
+        handle_ = RocJpegHandlePool::instance().acquire(backend_);
+
         // request() dereferences stream_handles_[i] for each tile and passes
         // handle_ + stream_handles_.data() to rocJpegDecodeBatched; both must be
-        // initialized here. The compressed input is host-resident (rocJpegStreamParse
-        // reads the JPEG header on the host CPU), so no device file-block backend
-        // decision is needed and the handle is created with the default backend_.
-        CHECK_ROCJPEG(rocJpegCreate(backend_, 0, &handle_));
-
+        // initialized. (Stream handles are still per-instance for now; they are
+        // cheap relative to rocJpegCreate.)
         stream_handles_.resize(cuda_batch_size_);
         for (uint32_t i = 0; i < cuda_batch_size_; ++i)
         {
@@ -274,10 +333,13 @@ RocJpegProcessor::~RocJpegProcessor()
     }
     stream_handles_.clear();
 
-    // Destroy the rocJPEG handle
+    // Return the rocJPEG handle to the process-level pool for reuse instead of
+    // destroying it (rocJpegDestroy is expensive and the handle is reusable
+    // across read_region() calls). The pool never destroys handles; the OS
+    // reclaims them at process exit.
     if (handle_)
     {
-        (void)rocJpegDestroy(handle_);
+        RocJpegHandlePool::instance().release(backend_, handle_);
         handle_ = nullptr;
     }
 
