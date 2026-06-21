@@ -57,6 +57,7 @@ public:
 
     uint32_t index() const;
     ifd_offset_t offset() const;
+    uint64_t hash_value() const;
 
     std::string& software();
     std::string& model();
