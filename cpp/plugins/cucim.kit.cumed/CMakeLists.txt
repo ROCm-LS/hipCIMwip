@@ -113,6 +113,14 @@ superbuild_depend(catch2)
 superbuild_depend(googletest)
 superbuild_depend(googlebenchmark)
 superbuild_depend(cli11)
+superbuild_depend(libdeflate)
+# DICOM compressed-pixel decoders (optional — OFF by default to avoid mmintrin/SSE
+# header conflicts when building with hipcc + GCC system includes)
+option(CUMED_DICOM_COMPRESSED "Build DICOM JPEG/JP2K decode support (requires cuslide sources)" OFF)
+if(CUMED_DICOM_COMPRESSED)
+    superbuild_depend(libjpeg-turbo)
+    superbuild_depend(libopenjpeg)
+endif()
 
 ################################################################################
 # Find cucim package
@@ -143,10 +151,21 @@ endif()
 ################################################################################
 
 # Add library
-add_library(${CUCIM_PLUGIN_NAME}
+set(CUSLIDE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../cucim.kit.cuslide/src)
+set(CUMED_SRCS
     src/cumed/cumed.cpp
     src/cumed/cumed.h
+    src/cumed/nifti.h
+    src/cumed/dicom.h
+)
+if(CUMED_DICOM_COMPRESSED)
+    list(APPEND CUMED_SRCS
+        ${CUSLIDE_SRC}/cuslide/jpeg/libjpeg_turbo.cpp
+        ${CUSLIDE_SRC}/cuslide/jpeg2k/libopenjpeg.cpp
     )
+    add_compile_definitions(CUMED_DICOM_COMPRESSED)
+endif()
+add_library(${CUCIM_PLUGIN_NAME} ${CUMED_SRCS})
 
 # Compile options
 set_target_properties(${CUCIM_PLUGIN_NAME}
@@ -164,11 +183,11 @@ target_compile_definitions(${CUCIM_PLUGIN_NAME} PRIVATE __HIP_PLATFORM_AMD__)
 
 
 # Link libraries
-target_link_libraries(${CUCIM_PLUGIN_NAME}
-        PRIVATE
-            deps::fmt
-            hipcim::hipcim
-        )
+set(CUMED_LINK_LIBS deps::fmt deps::libdeflate hipcim::hipcim)
+if(CUMED_DICOM_COMPRESSED)
+    list(APPEND CUMED_LINK_LIBS deps::libjpeg-turbo deps::libopenjpeg)
+endif()
+target_link_libraries(${CUCIM_PLUGIN_NAME} PRIVATE ${CUMED_LINK_LIBS})
 
 target_include_directories(${CUCIM_PLUGIN_NAME}
         PUBLIC
@@ -178,6 +197,8 @@ target_include_directories(${CUCIM_PLUGIN_NAME}
             ${CMAKE_CURRENT_LIST_DIR}/src
             # turbojpeg.h is not included in 'turbojpeg-static' so manually include
             ${deps-libjpeg-turbo_SOURCE_DIR}
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${CUSLIDE_SRC}>
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-openjpeg_SOURCE_DIR}/src/lib/openjp2>
         )
 
 # Do not generate SONAME as this would be used as plugin
