@@ -797,6 +797,132 @@ CuImage CuImage::read_region(std::vector<int64_t>&& location,
     const uint16_t ndim = image_container.ndim;
     auto& resource = out_metadata.get_resource();
 
+    // The metadata-setup block below assumes a 2-D whole-slide tile laid out as
+    // channels-last "YXC" (or "NYXC" for batches). That is true for the slide
+    // formats (cuslide TIFF/SVS, DICOM 2-D, MetaIO) but NOT for volumetric
+    // formats such as NIfTI, which the medical-image plugin returns as a
+    // multi-dimensional volume (e.g. "ZYXC" / "TZYXC"). Forcing the WSI
+    // assumptions on a volume reads out of bounds (e.g. shape[2] used as the
+    // channel count, the dims string indexed past its end) and crashes the
+    // process. When the source image is not a YXC slide, build region metadata
+    // directly from the returned DLPack container plus the source metadata,
+    // preserving the volume's dims/shape/dtype contract.
+    const char* src_dims = image_metadata_->dims;
+    const bool is_wsi_tile = src_dims && (std::strcmp(src_dims, "YXC") == 0);
+
+    if (!is_wsi_tile)
+    {
+        // ── Volume (non-YXC) region metadata: mirror the source image ─────────
+        std::pmr::vector<int64_t> v_shape(&resource);
+        v_shape.reserve(ndim);
+        v_shape.insert(v_shape.end(), &image_container.shape[0], &image_container.shape[ndim]);
+
+        // Copy the source dims string verbatim (e.g. "ZYXC").
+        size_t v_dims_len = strnlen(src_dims, 16);
+        char* v_dims_buf = static_cast<char*>(resource.allocate(v_dims_len + 1));
+        memcpy(v_dims_buf, src_dims, v_dims_len);
+        v_dims_buf[v_dims_len] = '\0';
+        std::string_view v_dims{ v_dims_buf, v_dims_len };
+
+        DLDataType& v_dtype = image_container.dtype;
+
+        // Channel names: one per channel (last dim of the volume). The
+        // ImageMetadataDesc has no channel-name count field, so derive the
+        // count from the container's trailing dimension and copy the source
+        // channel names defensively (the source array is sized to that count).
+        std::pmr::vector<std::string_view> v_channel_names(&resource);
+        int64_t v_nch = (ndim > 0) ? image_container.shape[ndim - 1] : 1;
+        if (v_nch < 0) v_nch = 0;
+        for (int64_t c = 0; c < v_nch; ++c)
+        {
+            const char* cn = (image_metadata_->channel_names) ? image_metadata_->channel_names[c] : nullptr;
+            size_t cn_len = cn ? strnlen(cn, 64) : 0;
+            char* cn_buf = static_cast<char*>(resource.allocate(cn_len + 1));
+            if (cn_len) memcpy(cn_buf, cn, cn_len);
+            cn_buf[cn_len] = '\0';
+            v_channel_names.emplace_back(std::string_view{ cn_buf, cn_len ? cn_len : 0 });
+            if (!cn_len) v_channel_names.back() = std::string_view{ "intensity" };
+        }
+
+        // Spacing / spacing_units: copy the source arrays (already sized to ndim).
+        std::pmr::vector<float> v_spacing(&resource);
+        v_spacing.reserve(ndim);
+        if (image_metadata_->spacing)
+            v_spacing.insert(v_spacing.end(), &image_metadata_->spacing[0], &image_metadata_->spacing[ndim]);
+        else
+            v_spacing.insert(v_spacing.end(), ndim, 1.0f);
+
+        std::pmr::vector<std::string_view> v_spacing_units(&resource);
+        v_spacing_units.reserve(ndim);
+        for (uint16_t d = 0; d < ndim; ++d)
+        {
+            const char* su = (image_metadata_->spacing_units) ? image_metadata_->spacing_units[d] : nullptr;
+            size_t su_len = su ? strnlen(su, 256) : 0;
+            char* su_buf = static_cast<char*>(resource.allocate(su_len + 1));
+            if (su_len) memcpy(su_buf, su, su_len);
+            su_buf[su_len] = '\0';
+            v_spacing_units.emplace_back(std::string_view{ su_buf, su_len });
+        }
+
+        // Origin (3), direction (3x3), coord_sys: copy verbatim from source.
+        std::pmr::vector<float> v_origin(&resource);
+        v_origin.reserve(3);
+        if (image_metadata_->origin)
+            v_origin.insert(v_origin.end(), &image_metadata_->origin[0], &image_metadata_->origin[3]);
+        else
+            v_origin.insert(v_origin.end(), 3, 0.0f);
+
+        std::pmr::vector<float> v_direction(&resource);
+        v_direction.reserve(9);
+        if (image_metadata_->direction)
+            v_direction.insert(v_direction.end(), &image_metadata_->direction[0], &image_metadata_->direction[9]);
+        else
+        {
+            const float ident[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            v_direction.insert(v_direction.end(), &ident[0], &ident[9]);
+        }
+
+        std::string_view v_coord_sys{ "" };
+        if (image_metadata_->coord_sys)
+        {
+            size_t cs_len = strnlen(image_metadata_->coord_sys, 16);
+            char* cs_buf = static_cast<char*>(resource.allocate(cs_len + 1));
+            memcpy(cs_buf, image_metadata_->coord_sys, cs_len);
+            cs_buf[cs_len] = '\0';
+            v_coord_sys = std::string_view{ cs_buf, cs_len };
+        }
+
+        // Resolution info: the whole volume is a single "level".
+        std::pmr::vector<int64_t> v_level_dimensions(&resource);
+        v_level_dimensions.insert(v_level_dimensions.end(), v_shape.begin(), v_shape.end());
+        std::pmr::vector<float> v_level_downsamples(&resource);
+        v_level_downsamples.emplace_back(1.0f);
+        std::pmr::vector<uint32_t> v_level_tile_sizes(&resource);
+        for (int64_t s : v_shape) v_level_tile_sizes.emplace_back(static_cast<uint32_t>(s));
+
+        out_metadata.ndim(ndim);
+        out_metadata.dims(std::move(v_dims));
+        out_metadata.shape(std::move(v_shape));
+        out_metadata.dtype(v_dtype);
+        out_metadata.channel_names(std::move(v_channel_names));
+        out_metadata.spacing(std::move(v_spacing));
+        out_metadata.spacing_units(std::move(v_spacing_units));
+        out_metadata.origin(std::move(v_origin));
+        out_metadata.direction(std::move(v_direction));
+        out_metadata.coord_sys(std::move(v_coord_sys));
+        out_metadata.level_count(1);
+        out_metadata.level_ndim(ndim);
+        out_metadata.level_dimensions(std::move(v_level_dimensions));
+        out_metadata.level_downsamples(std::move(v_level_downsamples));
+        out_metadata.level_tile_sizes(std::move(v_level_tile_sizes));
+        out_metadata.image_count(0);
+        out_metadata.image_names(std::pmr::vector<std::string_view>(&resource));
+        out_metadata.raw_data(std::string_view{ "" });
+        out_metadata.json_data(std::string_view{ "" });
+
+        return CuImage(this, &out_metadata.desc(), image_data.release());
+    }
+
     std::string_view dims{ "YXC" };
     if (batch_size > 1)
     {
