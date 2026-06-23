@@ -111,9 +111,11 @@ private:
 // Tiles decoded by one read_region() call are available on cache hits in subsequent calls,
 // matching the CPU path's use of the global ImageCache.
 //
-// The cache is intentionally leaked (never destroyed) via a raw pointer to avoid calling
-// cudaFree / hipFree in a static destructor after the HIP/ROCr runtime has been torn
-// down, which would crash or hang. At process exit the OS reclaims all device memory anyway.
+// The cache is intentionally leaked (never destroyed) via a raw pointer to avoid freeing
+// device memory in a static destructor after the HIP/ROCr runtime has been torn down, which
+// would crash or hang. (On this ROCm port the cache's kCUDA free path resolves to hipFree
+// via the cuda_runtime_api.h hipification shim; the same teardown hazard applies on AMD.)
+// At process exit the OS reclaims all device memory anyway.
 static std::shared_ptr<cucim::cache::ImageCache>& s_gpu_tile_cache()
 {
     static std::shared_ptr<cucim::cache::ImageCache>* cache = []() {
