@@ -121,9 +121,14 @@ static std::shared_ptr<cucim::cache::ImageCache>& s_gpu_tile_cache()
     static std::shared_ptr<cucim::cache::ImageCache>* cache = []() {
         cucim::cache::ImageCacheConfig cfg{};
         cfg.type = cucim::cache::CacheType::kPerProcess;
-        cfg.memory_capacity = 1024 * 1024; // effectively unbounded (1 TB sentinel)
-        // 4096 tiles ≈ 4× MAX_CUDA_BATCH_SIZE (1024), leaving headroom for a full batch
-        // plus cross-call reuse without self-eviction within a single batch.
+        // memory_capacity is in MiB (capacity_nbytes_ = kOneMiB * memory_capacity); this is a
+        // ~1 TiB byte budget used as a non-reserved sentinel so the byte ceiling never drives
+        // eviction. Device memory is hipMalloc'd lazily per tile, not pre-reserved.
+        cfg.memory_capacity = 1024 * 1024;
+        // The real bound is the tile COUNT: 4096 tiles ≈ 4× MAX_CUDA_BATCH_SIZE (1024), leaving
+        // headroom for a full batch plus cross-call reuse without self-eviction within a batch.
+        // At 256×256×3 ≈ 192 KiB/tile a full cache is ~768 MiB of VRAM — negligible on
+        // MI300X/MI355X (192–288 GB), and only reached if 4096 distinct tiles are touched.
         cfg.capacity = 4096;
         cfg.record_stat = true;   // track hit/miss to validate reuse in benchmarks
         return new std::shared_ptr<cucim::cache::ImageCache>(
