@@ -1,6 +1,8 @@
 # cmake-format: off
 # SPDX-FileCopyrightText: Copyright 2020-2025 NVIDIA Corporation
 # SPDX-License-Identifier: Apache-2.0
+#
+# Modifications Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 # cmake-format: on
 
 if (NOT TARGET deps::libjpeg-turbo)
