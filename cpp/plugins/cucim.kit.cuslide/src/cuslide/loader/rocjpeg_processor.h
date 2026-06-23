@@ -17,13 +17,16 @@
 #include <cucim/loader/tile_info.h>
 #include "cuslide/tiff/ifd.h"
 
-#include <iostream>
+#include <stdexcept>
+#include <string>
+// Raise a recoverable C++ exception on a rocJPEG/HIP API failure instead of
+// terminating the host process. cuslide callers already treat a failed batch
+// decode as a soft signal to fall back to the CPU path, so a thrown error lets
+// a single bad tile degrade gracefully rather than killing the whole process.
 static inline void PrintError(const char* file, const int line,
                               const char* context, const char* error) {
-    std::cerr << file << ":" << line << " error: "
-              << context << " returned '" << error << "'"
-              << std::endl;
-    exit(1);
+    throw std::runtime_error(std::string(file) + ":" + std::to_string(line) +
+                             " error: " + context + " returned '" + error + "'");
 }
 
 #define CHECK_ROCJPEG(call) {                                 \
