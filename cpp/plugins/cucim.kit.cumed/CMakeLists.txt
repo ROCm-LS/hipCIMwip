@@ -20,7 +20,7 @@ string(REGEX REPLACE "a.*$" "" VERSION ${VERSION})
 # Append local cmake module path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules")
 
-project(hipmed VERSION ${VERSION} DESCRIPTION "hipmed" LANGUAGES CXX)
+project(hipmed VERSION ${VERSION} DESCRIPTION "hipmed" LANGUAGES C CXX)
 set(CUCIM_PLUGIN_NAME "hipcim.kit.hipmed")
 
 ################################################################################
@@ -114,9 +114,13 @@ superbuild_depend(googletest)
 superbuild_depend(googlebenchmark)
 superbuild_depend(cli11)
 superbuild_depend(libdeflate)
-# DICOM compressed-pixel decoders (optional — OFF by default to avoid mmintrin/SSE
-# header conflicts when building with hipcc + GCC system includes)
-option(CUMED_DICOM_COMPRESSED "Build DICOM JPEG/JP2K decode support (requires cuslide sources)" OFF)
+# DICOM compressed-pixel decoders — ON by default.
+# libjpeg_turbo.cpp and libopenjpeg.cpp are pure CPU code; they do not contain
+# HIP/CUDA kernels but are compiled by hipcc (the project CXX compiler). CPATH
+# in the CK build environment exposes GCC x86 MMX/SSE intrinsic headers, which
+# hipcc/clang rejects with "unknown builtin __builtin_ia32_vec_init_v2si".
+# We suppress those macro guards per-file via set_source_files_properties below.
+option(CUMED_DICOM_COMPRESSED "Build DICOM JPEG/JP2K decode support (requires cuslide sources)" ON)
 if(CUMED_DICOM_COMPRESSED)
     superbuild_depend(libjpeg-turbo)
     superbuild_depend(libopenjpeg)
@@ -162,8 +166,31 @@ if(CUMED_DICOM_COMPRESSED)
     list(APPEND CUMED_SRCS
         ${CUSLIDE_SRC}/cuslide/jpeg/libjpeg_turbo.cpp
         ${CUSLIDE_SRC}/cuslide/jpeg2k/libopenjpeg.cpp
+        ${CUSLIDE_SRC}/cuslide/jpeg2k/color_conversion.cpp
+        ${deps-libopenjpeg_SOURCE_DIR}/src/bin/common/color.c
     )
     add_compile_definitions(CUMED_DICOM_COMPRESSED)
+    # libjpeg_turbo.cpp, libopenjpeg.cpp, color_conversion.cpp, color.c are pure
+    # CPU code compiled by hipcc. CPATH may expose GCC x86 MMX/SSE intrinsic
+    # headers that hipcc/clang rejects with unknown-builtin errors.
+    # Undefine SIMD feature macros for these files so the GCC headers do not
+    # emit __builtin_ia32_* builtins that clang doesn't know.
+    set_source_files_properties(
+        ${CUSLIDE_SRC}/cuslide/jpeg/libjpeg_turbo.cpp
+        ${CUSLIDE_SRC}/cuslide/jpeg2k/libopenjpeg.cpp
+        ${CUSLIDE_SRC}/cuslide/jpeg2k/color_conversion.cpp
+        ${deps-libopenjpeg_SOURCE_DIR}/src/bin/common/color.c
+        PROPERTIES COMPILE_OPTIONS
+            "-U__MMX__;-U__SSE__;-U__SSE2__;-U__SSE3__;-U__SSSE3__;-U__SSE4_1__;-U__SSE4_2__;-U__AVX__;-U__AVX2__"
+    )
+    # Compile color.c as plain C so symbols keep C linkage (no name mangling).
+    # libopenjpeg.cpp calls color_sycc_to_rgb etc. with C-linkage pointers, so
+    # CXX compilation would produce mismatched mangled names and linker failures.
+    # Matches what cucim.kit.cuslide does for the same file.
+    set_source_files_properties(
+        ${deps-libopenjpeg_SOURCE_DIR}/src/bin/common/color.c
+        PROPERTIES LANGUAGE C
+    )
 endif()
 add_library(${CUCIM_PLUGIN_NAME} ${CUMED_SRCS})
 
@@ -185,7 +212,7 @@ target_compile_definitions(${CUCIM_PLUGIN_NAME} PRIVATE __HIP_PLATFORM_AMD__)
 # Link libraries
 set(CUMED_LINK_LIBS deps::fmt deps::libdeflate hipcim::hipcim)
 if(CUMED_DICOM_COMPRESSED)
-    list(APPEND CUMED_LINK_LIBS deps::libjpeg-turbo deps::libopenjpeg)
+    list(APPEND CUMED_LINK_LIBS deps::libjpeg-turbo deps::libopenjpeg deps::libopenjpeg-lcms2)
 endif()
 target_link_libraries(${CUCIM_PLUGIN_NAME} PRIVATE ${CUMED_LINK_LIBS})
 
@@ -195,10 +222,13 @@ target_include_directories(${CUCIM_PLUGIN_NAME}
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE
             ${CMAKE_CURRENT_LIST_DIR}/src
-            # turbojpeg.h is not included in 'turbojpeg-static' so manually include
-            ${deps-libjpeg-turbo_SOURCE_DIR}
+            # turbojpeg.h + jconfig.h (generated) — only needed when JPEG decode is compiled
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-libjpeg-turbo_SOURCE_DIR}>
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-libjpeg-turbo_BINARY_DIR}>
             $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${CUSLIDE_SRC}>
-            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-openjpeg_SOURCE_DIR}/src/lib/openjp2>
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-libopenjpeg_SOURCE_DIR}/src/lib/openjp2>
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-libopenjpeg_BINARY_DIR}/src/lib/openjp2>
+            $<$<BOOL:${CUMED_DICOM_COMPRESSED}>:${deps-libopenjpeg_SOURCE_DIR}/src/bin/common>
         )
 
 # Do not generate SONAME as this would be used as plugin
