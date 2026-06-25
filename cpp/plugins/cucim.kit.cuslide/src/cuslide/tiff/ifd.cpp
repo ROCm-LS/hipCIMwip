@@ -484,6 +484,10 @@ ifd_offset_t IFD::offset() const
 {
     return ifd_offset_;
 }
+uint64_t IFD::hash_value() const
+{
+    return hash_value_;
+}
 
 std::string& IFD::software()
 {

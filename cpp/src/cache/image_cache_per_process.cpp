@@ -28,7 +28,10 @@ size_t hash<std::shared_ptr<cucim::cache::ImageCacheKey>>::operator()(
 bool equal_to<std::shared_ptr<cucim::cache::ImageCacheKey>>::operator()(
     const std::shared_ptr<cucim::cache::ImageCacheKey>& lhs, const std::shared_ptr<cucim::cache::ImageCacheKey>& rhs) const
 {
-    return lhs->location_hash == rhs->location_hash;
+    // Compare both fields: file_hash identifies the IFD/file, location_hash the tile index.
+    // Comparing only location_hash caused cross-IFD/cross-slide collisions in any
+    // process-level cache serving more than one slide or IFD.
+    return lhs->file_hash == rhs->file_hash && lhs->location_hash == rhs->location_hash;
 }
 
 } // namespace std
