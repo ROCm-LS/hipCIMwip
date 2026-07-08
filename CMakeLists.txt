@@ -1,13 +1,13 @@
 #
 # cmake-format: off
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Modifications Copyright (C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 # cmake-format: on
 #
 
-cmake_minimum_required(VERSION 3.26.4)
+cmake_minimum_required(VERSION 4.0 FATAL_ERROR)
 # NOTE(HIP/AMD): make *.cu files HIP lang files
 set(CMAKE_USER_MAKE_RULES_OVERRIDE "overrides.cmake")
 

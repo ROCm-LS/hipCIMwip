@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -24,6 +25,20 @@
 #include "ifd.h"
 
 static constexpr int DEFAULT_IFD_SIZE = 32;
+
+#ifdef CUCIM_HAS_NVIMGCODEC
+constexpr int kMetadataKindMedAperio = NVIMGCODEC_METADATA_KIND_MED_APERIO;
+constexpr int kMetadataKindMedPhilips = NVIMGCODEC_METADATA_KIND_MED_PHILIPS;
+constexpr int kMetadataKindMedVentana = NVIMGCODEC_METADATA_KIND_MED_VENTANA;
+constexpr int kMetadataKindMedLeica = NVIMGCODEC_METADATA_KIND_MED_LEICA;
+constexpr int kMetadataKindMedTrestle = NVIMGCODEC_METADATA_KIND_MED_TRESTLE;
+#else
+constexpr int kMetadataKindMedAperio = 5;
+constexpr int kMetadataKindMedPhilips = 6;
+constexpr int kMetadataKindMedVentana = 7;
+constexpr int kMetadataKindMedLeica = 8;
+constexpr int kMetadataKindMedTrestle = 9;
+#endif
 
 using json = nlohmann::json;
 
@@ -67,30 +82,44 @@ static void parse_string_array(const char* values, json& arr, PhilipsMetadataTyp
         {
             if (text[next_pos - 1] != '\\')
             {
-                switch (type)
+                try
                 {
-                case PhilipsMetadataType::IString:
-                    arr.emplace_back(std::string(text.substr(pos + 1, next_pos - pos - 1)));
-                    break;
-                case PhilipsMetadataType::IDouble:
-                    arr.emplace_back(std::stod(std::string(text.substr(pos + 1, next_pos - pos - 1))));
-                    break;
-                case PhilipsMetadataType::IUInt16:
-                case PhilipsMetadataType::IUInt32:
-                case PhilipsMetadataType::IUInt64:
-                    arr.emplace_back(std::stoul(std::string(text.substr(pos + 1, next_pos - pos - 1))));
-                    break;
+                    std::string val(text.substr(pos + 1, next_pos - pos - 1));
+                    switch (type)
+                    {
+                    case PhilipsMetadataType::IString:
+                        arr.emplace_back(std::move(val));
+                        break;
+                    case PhilipsMetadataType::IDouble:
+                        arr.emplace_back(std::stod(val));
+                        break;
+                    case PhilipsMetadataType::IUInt16:
+                    case PhilipsMetadataType::IUInt32:
+                    case PhilipsMetadataType::IUInt64:
+                        arr.emplace_back(std::stoul(val));
+                        break;
+                    }
+                }
+                catch (const std::exception&)
+                {
                 }
                 pos = next_pos + 1;
             }
         }
     }
 }
+static constexpr int kMaxXmlParseDepth = 32;
+
 static void parse_philips_tiff_metadata(const pugi::xml_node& node,
                                         json& metadata,
                                         const char* name,
-                                        PhilipsMetadataStage stage)
+                                        PhilipsMetadataStage stage,
+                                        int depth = 0)
 {
+    if (depth > kMaxXmlParseDepth)
+    {
+        return;
+    }
     switch (stage)
     {
     case PhilipsMetadataStage::ROOT:
@@ -101,7 +130,8 @@ static void parse_philips_tiff_metadata(const pugi::xml_node& node,
             const pugi::xml_attribute& attr_attribute = attr.attribute("Name");
             if (attr_attribute)
             {
-                parse_philips_tiff_metadata(attr, metadata, attr_attribute.value(), PhilipsMetadataStage::ELEMENT);
+                parse_philips_tiff_metadata(
+                    attr, metadata, attr_attribute.value(), PhilipsMetadataStage::ELEMENT, depth + 1);
             }
         }
         break;
@@ -166,7 +196,8 @@ static void parse_philips_tiff_metadata(const pugi::xml_node& node,
                         {
                             auto& item_iter = item_array_iter.first->emplace_back(json{});
                             parse_philips_tiff_metadata(
-                                data_node, item_iter, nullptr, PhilipsMetadataStage::PIXEL_DATA_PRESENTATION);
+                                data_node, item_iter, nullptr, PhilipsMetadataStage::PIXEL_DATA_PRESENTATION,
+                                depth + 1);
                         }
                     }
                     break;
@@ -218,13 +249,20 @@ static std::string strip_string(const std::string& str)
     }
 }
 
+static constexpr size_t kMaxImageDescriptionBytes = 1 * 1024 * 1024; // 1 MB
+
 static void parse_aperio_svs_metadata(std::shared_ptr<IFD>& first_ifd, json& metadata)
 {
     (void)metadata;
     std::string& desc = first_ifd->image_description();
 
-    // Assumes that metadata's image description starts with 'Aperio '.
-    // It is handled by 'resolve_vendor_format()'
+    if (desc.size() > kMaxImageDescriptionBytes)
+    {
+        fmt::print(stderr, "[Warning] Aperio SVS ImageDescription exceeds 1 MB limit ({}); skipping metadata parse\n",
+                   desc.size());
+        return;
+    }
+
     std::vector<std::string> items = split_string(desc, "|");
     if (items.size() < 1)
     {
@@ -510,25 +548,23 @@ void TIFF::resolve_vendor_format()
     {
         bool is_aperio = false;
 
-        // Method 1: Check ImageDescription starts with "Aperio "
         auto& image_desc = first_ifd->image_description();
         std::string_view prefix("Aperio ");
-        auto res = std::mismatch(prefix.begin(), prefix.end(), image_desc.begin());
-        if (res.first == prefix.end())
+        if (image_desc.size() >= prefix.size() &&
+            std::mismatch(prefix.begin(), prefix.end(), image_desc.begin()).first == prefix.end())
         {
             is_aperio = true;
         }
 
-        // Method 2: Check metadata_blobs for Aperio (kind=1)
-        // This includes the workaround for nvImageCodec 0.6.0 misclassifying Aperio as Leica
+        // Method 2: Check metadata_blobs for Aperio (MED_APERIO)
         if (!is_aperio && nvimgcodec_parser_)
         {
             const auto& metadata_blobs = nvimgcodec_parser_->get_metadata_blobs(0);
-            if (metadata_blobs.find(1) != metadata_blobs.end())  // MED_APERIO = 1
+            if (metadata_blobs.find(kMetadataKindMedAperio) != metadata_blobs.end())
             {
                 is_aperio = true;
                 #ifdef DEBUG
-                fmt::print("✅ Aperio detected via metadata_blobs workaround\n");
+                fmt::print("✅ Aperio detected via metadata_blobs\n");
                 #endif
             }
         }
@@ -540,21 +576,18 @@ void TIFF::resolve_vendor_format()
     }
 
     // Detect Philips TIFF
-    // NOTE: nvImageCodec 0.6.0 doesn't expose individual TIFF tags (like SOFTWARE)
-    // Workaround: Check for Philips XML in ImageDescription or use nvImageCodec metadata kind
+    // Check for Philips TIFF using SOFTWARE tag, ImageDescription XML, or nvImageCodec metadata kind
     {
         bool is_philips = false;
 
-        // Method 1: Check SOFTWARE tag (available in nvImageCodec 0.7.0+)
         std::string_view prefix("Philips");
-        auto res = std::mismatch(prefix.begin(), prefix.end(), software.begin());
-        if (res.first == prefix.end())
+        if (software.size() >= prefix.size() &&
+            std::mismatch(prefix.begin(), prefix.end(), software.begin()).first == prefix.end())
         {
             is_philips = true;
         }
 
-        // Method 2: Check for Philips XML structure in ImageDescription
-        // (Workaround for nvImageCodec 0.6.0 where SOFTWARE tag is not available)
+        // Method 2: Check for Philips XML structure in ImageDescription (fallback)
         if (!is_philips)
         {
             auto& image_desc = first_ifd->image_description();
@@ -565,16 +598,15 @@ void TIFF::resolve_vendor_format()
             }
         }
 
-        // Method 3: Check metadata_blobs for Philips (kind=2)
-        // This includes the workaround for nvImageCodec 0.6.0 misclassifying Philips as Ventana
+        // Method 3: Check metadata_blobs for Philips (MED_PHILIPS)
         if (!is_philips && nvimgcodec_parser_)
         {
             const auto& metadata_blobs = nvimgcodec_parser_->get_metadata_blobs(0);
-            if (metadata_blobs.find(2) != metadata_blobs.end())  // MED_PHILIPS = 2
+            if (metadata_blobs.find(kMetadataKindMedPhilips) != metadata_blobs.end())
             {
                 is_philips = true;
                 #ifdef DEBUG
-                fmt::print("✅ Philips detected via metadata_blobs workaround\n");
+                fmt::print("✅ Philips detected via metadata_blobs\n");
                 #endif
             }
         }
@@ -593,6 +625,68 @@ void TIFF::resolve_vendor_format()
         {
             _populate_philips_tiff_metadata(ifd_count, json_metadata, first_ifd);
         }
+    }
+
+    // Detect additional vendor formats (when not already classified as Aperio/Philips)
+    if (tiff_type_ == TiffType::Generic)
+    {
+        auto& image_desc = first_ifd->image_description();
+        std::string file_ext;
+        {
+            std::string path_str(file_path_.c_str());
+            auto dot_pos = path_str.rfind('.');
+            if (dot_pos != std::string::npos)
+            {
+                file_ext = path_str.substr(dot_pos);
+                std::transform(file_ext.begin(), file_ext.end(), file_ext.begin(), ::tolower);
+            }
+        }
+
+        const std::remove_reference_t<decltype(nvimgcodec_parser_->get_metadata_blobs(0))>* blobs =
+            nvimgcodec_parser_ ? &nvimgcodec_parser_->get_metadata_blobs(0) : nullptr;
+
+        // Hamamatsu NDPI: extension .ndpi or MODEL contains "Hamamatsu"
+        if (file_ext == ".ndpi" || model.find("Hamamatsu") != std::string::npos)
+        {
+            tiff_type_ = TiffType::Hamamatsu;
+        }
+        // Ventana BIF: extension .bif or nvImageCodec MED_VENTANA blob
+        else if (file_ext == ".bif" ||
+                 (blobs && blobs->find(kMetadataKindMedVentana) != blobs->end()))
+        {
+            tiff_type_ = TiffType::Ventana;
+        }
+        // Leica SCN: extension .scn or nvImageCodec MED_LEICA blob
+        else if (file_ext == ".scn" ||
+                 (blobs && blobs->find(kMetadataKindMedLeica) != blobs->end()))
+        {
+            tiff_type_ = TiffType::Leica;
+        }
+        // Trestle TIFF: nvImageCodec MED_TRESTLE blob
+        else if (blobs && blobs->find(kMetadataKindMedTrestle) != blobs->end())
+        {
+            tiff_type_ = TiffType::Trestle;
+        }
+        // OME-TIFF: ImageDescription contains OME XML namespace
+        else if (image_desc.find("<OME") != std::string::npos ||
+                 image_desc.find("ome.xsd") != std::string::npos)
+        {
+            tiff_type_ = TiffType::OmeTiff;
+        }
+        // Vectra QPTIFF: extension .qptiff or ImageDescription contains PerkinElmer
+        else if (file_ext == ".qptiff" ||
+                 image_desc.find("PerkinElmer") != std::string::npos ||
+                 image_desc.find("Vectra") != std::string::npos)
+        {
+            tiff_type_ = TiffType::QpTiff;
+        }
+
+        #ifdef DEBUG
+        if (tiff_type_ != TiffType::Generic)
+        {
+            fmt::print("✅ Detected vendor format: {}\n", static_cast<uint32_t>(tiff_type_));
+        }
+        #endif
     }
 
     // Append TIFF metadata
@@ -691,6 +785,12 @@ void TIFF::_populate_philips_tiff_metadata(uint16_t ifd_count, void* metadata, s
             pixel_spacings.emplace_back(std::pair{ spacing_x, spacing_y });
         }
 
+        if (pixel_spacings.empty())
+        {
+            fmt::print(stderr, "[Warning] Philips TIFF: no DICOM_PIXEL_SPACING entries found\n");
+            return;
+        }
+
         double spacing_x_l0 = pixel_spacings[0].first;
         double spacing_y_l0 = pixel_spacings[0].second;
 
@@ -706,8 +806,12 @@ void TIFF::_populate_philips_tiff_metadata(uint16_t ifd_count, void* metadata, s
             // NOTE: In Philips TIFF, pyramid levels can be strip-based (tile_width==0)
             // So we can't use tile_width to identify associated images
             auto& image_desc = ifd->image_description();
-            bool is_macro = (std::mismatch(macro_prefix.begin(), macro_prefix.end(), image_desc.begin()).first == macro_prefix.end());
-            bool is_label = (std::mismatch(label_prefix.begin(), label_prefix.end(), image_desc.begin()).first == label_prefix.end());
+            bool is_macro = (image_desc.size() >= macro_prefix.size() &&
+                             std::mismatch(macro_prefix.begin(), macro_prefix.end(), image_desc.begin()).first ==
+                                 macro_prefix.end());
+            bool is_label = (image_desc.size() >= label_prefix.size() &&
+                             std::mismatch(label_prefix.begin(), label_prefix.end(), image_desc.begin()).first ==
+                                 label_prefix.end());
 
             if (is_macro || is_label)
             {
@@ -738,9 +842,11 @@ void TIFF::_populate_philips_tiff_metadata(uint16_t ifd_count, void* metadata, s
                 double downsample = std::round((pixel_spacings[spacing_index].first / spacing_x_l0 +
                                                 pixel_spacings[spacing_index].second / spacing_y_l0) /
                                                2);
-                // Fix width and height of IFD
-                ifd->width_ = width_l0 / downsample;
-                ifd->height_ = height_l0 / downsample;
+                if (downsample > 0)
+                {
+                    ifd->width_ = width_l0 / downsample;
+                    ifd->height_ = height_l0 / downsample;
+                }
                 ++spacing_index;
             }
             else
@@ -779,27 +885,23 @@ void TIFF::_populate_philips_tiff_metadata(uint16_t ifd_count, void* metadata, s
                 {
                     auto node_offset = associated_node.node().offset_debug();
 
-                    if (node_offset >= 0)
+                    size_t image_desc_len = first_ifd->image_description().size();
+                    if (node_offset >= 0 && static_cast<size_t>(node_offset) < image_desc_len)
                     {
-                        // `image_desc_cstr[node_offset]` would point to the following text:
-                        //   Attribute Element="0x1004" Group="0x301D" Name="PIM_DP_IMAGE_DATA" PMSVR="IString">
-                        //     (base64-encoded JPEG image)
-                        //   </Attribute>
-                        //
+                        const char* data_ptr = image_desc_cstr + node_offset;
+                        const char* desc_end = image_desc_cstr + image_desc_len;
 
-                        // 34 is from `Attribute Name="PIM_DP_IMAGE_DATA"`
-                        char* data_ptr = const_cast<char*>(image_desc_cstr) + node_offset + 34;
-                        uint32_t data_len = 0;
-                        while (*data_ptr != '>' && *data_ptr != '\0')
+                        // Find '>' that closes the opening <Attribute ...> tag
+                        while (data_ptr < desc_end && *data_ptr != '>')
                         {
                             ++data_ptr;
                         }
-                        if (*data_ptr != '\0')
+                        uint32_t data_len = 0;
+                        if (data_ptr < desc_end && *data_ptr != '\0')
                         {
                             ++data_ptr; // start of base64-encoded data
-                            char* data_end_ptr = data_ptr;
-                            // Seek until it finds '<' for '</Attribute>'
-                            while (*data_end_ptr != '<' && *data_end_ptr != '\0')
+                            const char* data_end_ptr = data_ptr;
+                            while (data_end_ptr < desc_end && *data_end_ptr != '<' && *data_end_ptr != '\0')
                             {
                                 ++data_end_ptr;
                             }

@@ -778,11 +778,10 @@ bool IFD::read_region_tiles(const TIFF* tiff,
                         }
                         tile_data = static_cast<uint8_t*>(value->data);
 
-                        cudaError_t cuda_status;
-                        cudaMemcpy2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
+                        CUDA_ERROR(cudaMemcpy2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
                                                 tile_data + nbytes_tile_index, nbytes_tw, nbytes_tile_pixel_size_x,
                                                 tile_pixel_offset_ey - tile_pixel_offset_sy + 1,
-                                                cudaMemcpyDeviceToDevice);
+                                                cudaMemcpyDeviceToDevice));
                     }
                     else
                     {
@@ -879,10 +878,9 @@ bool IFD::read_region_tiles(const TIFF* tiff,
                     }
                     else
                     {
-                        cudaError_t cuda_status;
-                        cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y, background_value,
+                        CUDA_ERROR(cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y, background_value,
                                                 nbytes_tile_pixel_size_x,
-                                                tile_pixel_offset_ey - tile_pixel_offset_sy + 1);
+                                                tile_pixel_offset_ey - tile_pixel_offset_sy + 1));
                     }
                 }
             };
@@ -1147,43 +1145,42 @@ bool IFD::read_region_tiles_boundary(const TIFF* tiff,
 
                         tile_data = static_cast<uint8_t*>(value->data);
 
-                        cudaError_t cuda_status;
                         if (copy_partial)
                         {
                             uint32_t fill_gap_x = nbytes_tile_pixel_size_x - fixed_nbytes_tile_pixel_size_x;
                             // Fill original, then fill white for remaining
                             if (fill_gap_x > 0)
                             {
-                                cudaMemcpy2D(
+                                CUDA_ERROR(cudaMemcpy2D(
                                     dest_start_ptr + dest_pixel_index, dest_pixel_step_y, tile_data + nbytes_tile_index,
                                     nbytes_tw, fixed_nbytes_tile_pixel_size_x,
-                                    fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1, cudaMemcpyDeviceToDevice);
-                                cudaMemset2D(dest_start_ptr + dest_pixel_index + fixed_nbytes_tile_pixel_size_x,
+                                    fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1, cudaMemcpyDeviceToDevice));
+                                CUDA_ERROR(cudaMemset2D(dest_start_ptr + dest_pixel_index + fixed_nbytes_tile_pixel_size_x,
                                                         dest_pixel_step_y, background_value, fill_gap_x,
-                                                        fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1);
+                                                        fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1));
                                 dest_pixel_index +=
                                     dest_pixel_step_y * (fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1);
                             }
                             else
                             {
-                                cudaMemcpy2D(
+                                CUDA_ERROR(cudaMemcpy2D(
                                     dest_start_ptr + dest_pixel_index, dest_pixel_step_y, tile_data + nbytes_tile_index,
                                     nbytes_tw, fixed_nbytes_tile_pixel_size_x,
-                                    fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1, cudaMemcpyDeviceToDevice);
+                                    fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1, cudaMemcpyDeviceToDevice));
                                 dest_pixel_index +=
                                     dest_pixel_step_y * (fixed_tile_pixel_offset_ey - tile_pixel_offset_sy + 1);
                             }
 
-                            cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
+                            CUDA_ERROR(cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
                                                     background_value, nbytes_tile_pixel_size_x,
-                                                    tile_pixel_offset_ey - (fixed_tile_pixel_offset_ey + 1) + 1);
+                                                    tile_pixel_offset_ey - (fixed_tile_pixel_offset_ey + 1) + 1));
                         }
                         else
                         {
-                            cudaMemcpy2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
+                            CUDA_ERROR(cudaMemcpy2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y,
                                                     tile_data + nbytes_tile_index, nbytes_tw, nbytes_tile_pixel_size_x,
                                                     tile_pixel_offset_ey - tile_pixel_offset_sy + 1,
-                                                    cudaMemcpyDeviceToDevice);
+                                                    cudaMemcpyDeviceToDevice));
                         }
                     }
                     else
@@ -1314,9 +1311,8 @@ bool IFD::read_region_tiles_boundary(const TIFF* tiff,
                     }
                     else
                     {
-                        cudaError_t cuda_status;
-                        cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y, background_value,
-                                                nbytes_tile_pixel_size_x, tile_pixel_offset_ey - tile_pixel_offset_sy);
+                        CUDA_ERROR(cudaMemset2D(dest_start_ptr + dest_pixel_index, dest_pixel_step_y, background_value,
+                                                nbytes_tile_pixel_size_x, tile_pixel_offset_ey - tile_pixel_offset_sy));
                     }
                 }
             };
