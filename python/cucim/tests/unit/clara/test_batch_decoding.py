@@ -372,6 +372,17 @@ class TestBatchDecodingCUDA:
         except ImportError:
             pytest.skip("CuPy not installed")
 
+    @staticmethod
+    def _skip_if_rocjpeg_init_error(exc):
+        """Skip test if the error is a rocJPEG/VA-API initialization failure."""
+        msg = str(exc)
+        if "ROCJPEG_STATUS_NOT_INITIALIZED" in msg:
+            pytest.skip(
+                "rocJPEG VA-API initialization failed — render node "
+                "may be inaccessible (GPU partitioning/SR-IOV, "
+                "missing VA-API driver, or permissions)"
+            )
+
     def test_batch_read_cuda_output(
         self, testimg_tiff_stripe_4096x4096_256_jpeg
     ):
@@ -390,9 +401,13 @@ class TestBatchDecodingCUDA:
             size = (256, 256)
             level = 0
 
-            gen = img.read_region(
-                locations, size, level, num_workers=2, device="cuda"
-            )
+            try:
+                gen = img.read_region(
+                    locations, size, level, num_workers=2, device="cuda"
+                )
+            except RuntimeError as e:
+                self._skip_if_rocjpeg_init_error(e)
+                raise
 
             for result in gen:
                 # Should have CUDA array interface
@@ -421,9 +436,13 @@ class TestBatchDecodingCUDA:
             size = (256, 256)
 
             for _ in range(5):
-                gen = img.read_region(
-                    locations, size, 0, num_workers=2, device="cuda"
-                )
+                try:
+                    gen = img.read_region(
+                        locations, size, 0, num_workers=2, device="cuda"
+                    )
+                except RuntimeError as e:
+                    self._skip_if_rocjpeg_init_error(e)
+                    raise
                 for result in gen:
                     _ = cp.asarray(result)
 
