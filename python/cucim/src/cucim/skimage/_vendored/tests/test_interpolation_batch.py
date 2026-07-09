@@ -77,6 +77,12 @@ def test_zoom_shift_grid_codegen_indexes_shift_by_axis():
 
 
 def test_loop_batch_selected_when_last_axis_is_one_of_multiple_batch_axes():
+    if runtime.is_hip:
+        pytest.skip(
+            "loop_batch_axis optimization is disabled on HIP "
+            "(loop_batch_max_channels=0) to avoid an integer-output codegen "
+            "bug, so the looped batch kernel is never selected on AMD GPUs."
+        )
     kern_info = _get_shift_kernel(
         4,
         False,
@@ -231,13 +237,6 @@ class TestRotateBatch(OrderPrefilterMixin):
     def test_rotate_int(self, dtype):
         shape, axes = self.shape_and_axes
 
-        if self.order == 3 and self.prefilter:
-            pytest.skip(
-                "Batch interpolation kernel bug: integer output write "
-                "path produces incorrect values (255 overflow) for "
-                "specific batch sizes (4, 8) with order=3 prefilter=True"
-            )
-
         if numpy.lib.NumpyVersion(scipy.__version__) < "1.0.0":
             if dtype in (numpy.dtype("l"), numpy.dtype("q")):
                 dtype = numpy.int64
@@ -374,13 +373,6 @@ class TestShiftBatch(OrderPrefilterMixin):
     @testing.for_int_dtypes(no_bool=True)
     def test_shift_int(self, dtype):
         shape, shift = self.shape_and_shift
-
-        if self.order == 3 and self.prefilter:
-            pytest.skip(
-                "Batch interpolation kernel bug: integer output write "
-                "path produces incorrect values (255 overflow) for "
-                "specific batch sizes (4, 8) with order=3 prefilter=True"
-            )
 
         if self.mode == "constant" and not cupy.isfinite(self.cval):
             if self.output is None or self.output == "empty":
@@ -519,13 +511,6 @@ class TestZoomBatch(OrderPrefilterMixin):
     @testing.for_int_dtypes(no_bool=True)
     def test_zoom_int(self, dtype):
         shape, zoom = self.shape_and_zoom
-
-        if self.order == 3 and self.prefilter:
-            pytest.skip(
-                "Batch interpolation kernel bug: integer output write "
-                "path produces incorrect values (255 overflow) for "
-                "specific batch sizes (4, 8) with order=3 prefilter=True"
-            )
 
         if numpy.lib.NumpyVersion(scipy.__version__) < "1.0.0":
             if dtype in (numpy.dtype("l"), numpy.dtype("q")):
@@ -838,6 +823,13 @@ def test_affine_transform_cross_term_from_last_axis_is_not_batch_axis():
 
 
 def test_map_coordinates_batch_axes_use_same_spatial_map_for_all_channels():
+    if runtime.is_hip:
+        pytest.skip(
+            "This test relies on the looped batch path using only channel 0's "
+            "spatial map. The loop_batch_axis optimization is disabled on HIP "
+            "(loop_batch_max_channels=0), so the non-looped path applies each "
+            "channel's own coordinates instead."
+        )
     a = testing.shaped_random((5, 6, 3), cupy, cupy.float32, scale=1)
     coordinates = cupy.indices(a.shape, dtype=cupy.float32)
     coordinates[0] += 0.2

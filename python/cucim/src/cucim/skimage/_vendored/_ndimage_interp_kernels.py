@@ -34,7 +34,15 @@ spline_weights_inline = _spline_kernel_weights.spline_weights_inline
 
 # Empirical threshold above which using loop_batch_axis=True begins to become
 # disadvantageous.
-loop_batch_max_channels = 12
+# On AMD GPUs (HIP), the loop_batch_axis kernel path produces incorrect integer
+# output for batch sizes 4 and 8. The float accumulation is correct but the
+# (Y)rint(...) output write to raw unsigned char array corrupts specific
+# channels. Root cause is under investigation (possible HIPRTC codegen issue
+# with byte stores to CArray<unsigned char> via manual indexing).
+if cupy.cuda.runtime.is_hip:
+    loop_batch_max_channels = 0
+else:
+    loop_batch_max_channels = 12
 
 
 def _get_coord_map(
