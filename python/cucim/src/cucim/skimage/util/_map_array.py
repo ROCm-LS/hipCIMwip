@@ -84,10 +84,8 @@ def map_array(input_arr, input_vals, output_vals, out=None):
             f"the input array. Input array has shape {orig_shape}, provided "
             f"output array has shape {out.shape}."
         )
-    try:
-        out_view = out.view()
-        out_view.shape = (-1,)  # no-copy reshape/ravel
-    except AttributeError:  # if out strides are not compatible with 0-copy
+    out_view = out.reshape(-1)
+    if not out_view.base is out and not (out_view.base is not None and out_view.base is out.base):
         raise ValueError(
             "If out array is provided, it should be either contiguous "
             f"or 1-dimensional. Got array with shape {out.shape} and "
