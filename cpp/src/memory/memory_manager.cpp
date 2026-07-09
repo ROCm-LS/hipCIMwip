@@ -9,8 +9,6 @@
 
 #include "cucim/memory/memory_manager.h"
 
-#include <memory_resource>
-
 #include <cucim/cuda_runtime.h>
 #include <fmt/format.h>
 

@@ -11,6 +11,17 @@ init_globals() {
     #export TOP=$(git rev-parse --show-toplevel || $(dirname "${RUN_SCRIPT_FILE}"))
     export TOP=$(git rev-parse --show-toplevel 2>/dev/null || pwd) # pwd added for pipeline
     export AMDGPU_TARGETS=${AMDGPU_TARGETS:-"gfx942;gfx950"}
+
+    # Derive GCC toolchain root from gcc on PATH for hipcc/clang to find
+    # libstdc++ headers (e.g. <memory_resource> requires GCC >= 9).
+    # Only used when compiling with hipcc (clang-based), not system GCC.
+    if [ -z "${GCC_TOOLCHAIN_ROOT:-}" ]; then
+        local _gcc_path
+        _gcc_path=$(readlink -f "$(which gcc 2>/dev/null)" 2>/dev/null)
+        if [ -n "${_gcc_path}" ]; then
+            export GCC_TOOLCHAIN_ROOT=$(dirname "$(dirname "${_gcc_path}")")
+        fi
+    fi
 }
 
 ################################################################################
@@ -270,6 +281,12 @@ build_local_libhipcim_() {
         c_compiler_flag="-DCMAKE_C_COMPILER=hipcc"
     fi
 
+    # Pass --gcc-toolchain to hipcc so it finds the correct libstdc++ headers
+    local gcc_toolchain_flag=""
+    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
+        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+    fi
+
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
         -DCMAKE_PREFIX_PATH=${prefix} \
@@ -279,6 +296,7 @@ build_local_libhipcim_() {
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
         ${c_compiler_flag} \
+        ${gcc_toolchain_flag} \
         -DENABLE_CODE_COVERAGE=${enable_coverage} \
         -DGPU_TARGETS=${AMDGPU_TARGETS}
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim -- -j $(nproc)
@@ -300,12 +318,19 @@ build_local_hipslide_() {
     pushd ${source_folder} > /dev/null
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+
+    local gcc_toolchain_flag=""
+    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
+        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+    fi
+
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_BUILD_TYPE=${build_type_str} \
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
+        ${gcc_toolchain_flag} \
         -DGPU_TARGETS=${AMDGPU_TARGETS} \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
@@ -328,12 +353,19 @@ build_local_hipmed_() {
 
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+
+    local gcc_toolchain_flag=""
+    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
+        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+    fi
+
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_BUILD_TYPE=${build_type_str} \
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
+        ${gcc_toolchain_flag} \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
     ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipmed -- -j $(nproc)

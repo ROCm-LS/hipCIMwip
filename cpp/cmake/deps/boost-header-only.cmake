@@ -9,6 +9,11 @@
 #
 
 if (NOT TARGET deps::boost-header-only)
+    # CMP0169 OLD needed: FetchContent_Populate() with declared details is used
+    # here to apply patches after fetch, which requires the legacy behavior.
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0169 OLD)
+
     set(Boost_VERSION 1.75.0)
     set(boost_component_list "interprocess" "config" "intrusive" "move" "assert" "static_assert" "container" "core" "date_time" "smart_ptr" "throw_exception" "utility" "type_traits" "numeric/conversion" "mpl" "preprocessor" "container_hash" "integer" "detail")
     FetchContent_Declare(
@@ -81,4 +86,6 @@ if (NOT TARGET deps::boost-header-only)
 
     set(deps-boost-header-only_SOURCE_DIR ${deps-boost-header-only_SOURCE_DIR} CACHE INTERNAL "" FORCE)
     mark_as_advanced(deps-boost-header-only_SOURCE_DIR)
+
+    cmake_policy(POP)
 endif ()

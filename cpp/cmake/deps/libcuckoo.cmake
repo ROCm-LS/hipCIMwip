@@ -7,6 +7,11 @@
 # cmake-format: on
 
 if (NOT TARGET deps::libcuckoo)
+    # CMP0169 OLD needed: FetchContent_Populate() with declared details is used
+    # here to apply a patch after fetch, which requires the legacy behavior.
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0169 OLD)
+
     FetchContent_Declare(
             deps-libcuckoo
             GIT_REPOSITORY https://github.com/efficient/libcuckoo
@@ -60,4 +65,6 @@ if (NOT TARGET deps::libcuckoo)
     target_link_libraries(deps::libcuckoo INTERFACE libcuckoo)
     set(deps-libcuckoo_SOURCE_DIR ${deps-libcuckoo_SOURCE_DIR} CACHE INTERNAL "" FORCE)
     mark_as_advanced(deps-libcuckoo_SOURCE_DIR)
+
+    cmake_policy(POP)
 endif ()
