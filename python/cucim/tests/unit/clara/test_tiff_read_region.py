@@ -7,6 +7,7 @@
 
 import numpy as np
 import pytest
+from pytest_lazy_fixtures import lf as lazy_fixture
 
 from ...util.io import open_image_cucim
 
@@ -98,6 +99,40 @@ def test_tiff_stripe_outside(testimg_tiff_stripe_32x24_16):
         count_all_zero = np.count_nonzero(channel_value_count == 0)
         # All pixels would be zero.
         assert count_all_zero == (tile_width * tile_height)
+
+
+@pytest.mark.parametrize(
+    "lzw_image",
+    [
+        lazy_fixture("testimg_tiff_stripe_32x24_16_lzw"),
+        lazy_fixture("testimg_tiff_stripe_32x24_16_lzw_predictor"),
+    ],
+)
+def test_tiff_stripe_lzw_lossless(lzw_image):
+    # LZW is a lossless codec, so cuCIM-decoded pixels must match the source
+    # image exactly. This exercises the LZW decoder (decode_lzw -> lzw_libtiff),
+    # including the horizontal-differencing predictor variant, for both a
+    # whole-image read and a tile-spanning region.
+    import tifffile
+
+    cucim_img = open_image_cucim(lzw_image)
+    width, height = cucim_img.size("XY")
+    reference = tifffile.imread(lzw_image)
+
+    whole = np.asarray(cucim_img.read_region((0, 0), (width, height)))
+    np.testing.assert_array_equal(whole, reference)
+
+    tile_width, tile_height = cucim_img.resolutions["level_tile_sizes"][0]
+    start_x, start_y = tile_width // 2, tile_height // 2
+    partial = np.asarray(
+        cucim_img.read_region((start_x, start_y), (tile_width, tile_height))
+    )
+    np.testing.assert_array_equal(
+        partial,
+        reference[
+            start_y : start_y + tile_height, start_x : start_x + tile_width
+        ],
+    )
 
 
 def test_tiff_outside_of_resolution_level(testimg_tiff_stripe_4096x4096_256):

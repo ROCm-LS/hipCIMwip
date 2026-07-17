@@ -10,7 +10,12 @@ from tempfile import mkdtemp
 import numpy as np
 from tifffile import TiffWriter
 
-COMPRESSION_MAP = {"jpeg": "jpeg", "deflate": "deflate", "raw": None}
+COMPRESSION_MAP = {
+    "jpeg": "jpeg",
+    "deflate": "deflate",
+    "lzw": "lzw",
+    "raw": None,
+}
 
 
 class TiffGenerator:
@@ -46,6 +51,15 @@ class TiffGenerator:
         else:
             raise RuntimeError("'image_data' is neithor list or numpy.ndarray")
 
+        # A "<codec>_predictor" token selects the codec plus horizontal
+        # differencing (TIFF predictor=2), e.g. "lzw_predictor".
+        predictor = None
+        if isinstance(compression, str) and compression.endswith(
+            "_predictor"
+        ):
+            compression = compression[: -len("_predictor")]
+            predictor = 2
+
         compression = COMPRESSION_MAP.get(compression)
         compressionargs = None
         if not compression:
@@ -78,6 +92,7 @@ class TiffGenerator:
                     planarconfig="CONTIG",
                     compression=compression,  # requires imagecodecs
                     compressionargs=compressionargs,
+                    predictor=predictor,
                     subfiletype=1 if level else 0,
                     resolution=level_resolution,
                     resolutionunit=resolutionunit,
