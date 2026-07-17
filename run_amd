@@ -297,6 +297,7 @@ build_local_libhipcim_() {
         -DCMAKE_CXX_COMPILER=hipcc \
         ${c_compiler_flag} \
         ${gcc_toolchain_flag} \
+        $(fetchcontent_offline_flag_ ${build_folder}) \
         -DENABLE_CODE_COVERAGE=${enable_coverage} \
         -DGPU_TARGETS=${AMDGPU_TARGETS}
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim -- -j $(nproc)
@@ -312,6 +313,7 @@ build_local_hipslide_() {
     local build_type=${2:-debug}
     local build_type_str=${3:-Debug}
     local prefix=${4:-}
+    local enable_coverage=${5:-OFF}
     local build_folder=${source_folder}/build-${build_type}
     local CMAKE_CMD=${CMAKE_CMD:-cmake}
 
@@ -319,10 +321,21 @@ build_local_hipslide_() {
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
 
-    local gcc_toolchain_flag=""
+    # Inject LLVM coverage instrumentation (plus any --gcc-toolchain) into
+    # CMAKE_CXX_FLAGS. The plugin CMake project does not honor
+    # ENABLE_CODE_COVERAGE, so the flags are injected directly here.
+    local extra_cmake_args=()
+    local cxx_flags=""
     if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
-        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+        cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
     fi
+    if [ "${enable_coverage}" = "ON" ]; then
+        # Instrument only C++ sources. Do NOT override the C compiler or add C
+        # coverage flags: the bundled third-party C libs (e.g. openjpeg) fail to
+        # build when forced through hipcc/clang++ (-x c) with coverage flags.
+        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
+    fi
+    [ -n "${cxx_flags}" ] && extra_cmake_args+=("-DCMAKE_CXX_FLAGS=${cxx_flags}")
 
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
@@ -330,11 +343,19 @@ build_local_hipslide_() {
         -DCMAKE_BUILD_TYPE=${build_type_str} \
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
-        ${gcc_toolchain_flag} \
+        "${extra_cmake_args[@]}" \
+        $(fetchcontent_offline_flag_ ${build_folder}) \
         -DGPU_TARGETS=${AMDGPU_TARGETS} \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
-    ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipslide -- -j $(nproc)
+    if [ "${enable_coverage}" = "ON" ]; then
+        # Build all plugin targets (lib + tests + benchmarks) so the test
+        # binaries exist, are instrumented, and can exercise the plugin for
+        # coverage; then install so they land in install/{lib,bin}.
+        ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} -- -j $(nproc)
+    else
+        ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipslide -- -j $(nproc)
+    fi
     ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target install -- -j $(nproc)
 
     popd
@@ -345,6 +366,7 @@ build_local_hipmed_() {
     local build_type=${2:-debug}
     local build_type_str=${3:-Debug}
     local prefix=${4:-}
+    local enable_coverage=${5:-OFF}
     local build_folder=${source_folder}/build-${build_type}
     local CMAKE_CMD=${CMAKE_CMD:-cmake}
     local cucim_source_folder=${TOP}
@@ -354,10 +376,21 @@ build_local_hipmed_() {
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
 
-    local gcc_toolchain_flag=""
+    # Inject LLVM coverage instrumentation (plus any --gcc-toolchain) into
+    # CMAKE_CXX_FLAGS. The plugin CMake project does not honor
+    # ENABLE_CODE_COVERAGE, so the flags are injected directly here.
+    local extra_cmake_args=()
+    local cxx_flags=""
     if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
-        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+        cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
     fi
+    if [ "${enable_coverage}" = "ON" ]; then
+        # Instrument only C++ sources. Do NOT override the C compiler or add C
+        # coverage flags: the bundled third-party C libs (e.g. openjpeg) fail to
+        # build when forced through hipcc/clang++ (-x c) with coverage flags.
+        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
+    fi
+    [ -n "${cxx_flags}" ] && extra_cmake_args+=("-DCMAKE_CXX_FLAGS=${cxx_flags}")
 
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
         -DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE \
@@ -365,10 +398,18 @@ build_local_hipmed_() {
         -DCMAKE_BUILD_TYPE=${build_type_str} \
         -DCMAKE_PREFIX_PATH=${prefix} \
         -DCMAKE_CXX_COMPILER=hipcc \
-        ${gcc_toolchain_flag} \
+        "${extra_cmake_args[@]}" \
+        $(fetchcontent_offline_flag_ ${build_folder}) \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
-    ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipmed -- -j $(nproc)
+    if [ "${enable_coverage}" = "ON" ]; then
+        # Build all plugin targets (lib + tests + benchmarks) so the test
+        # binaries exist, are instrumented, and can exercise the plugin for
+        # coverage; then install so they land in install/{lib,bin}.
+        ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} -- -j $(nproc)
+    else
+        ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim.kit.hipmed -- -j $(nproc)
+    fi
     ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target install -- -j $(nproc)
 
     popd
@@ -407,10 +448,36 @@ build_local_desc() { echo 'Build locally
 Compile binaries locally
 
 Arguments:
-  $1 - subcommand [all|clean_cache|clean|cpp|libcucim|cuslide|cumed|cucim] (default: all)
+  $1 - subcommand [all|clean_cache|clean|clean_keep_deps|cpp|libcucim|cuslide|cumed|cucim] (default: all)
   $2 - build type [debug|release|rel-debug] (default: debug)
 '
 }
+clean_build_keep_deps_() {
+    # Delete build outputs from each given build directory but KEEP its `_deps/`
+    # subdir (CMake FetchContent-downloaded 3rd-party sources) so rebuilds do not
+    # re-download them. Entries are made writable first (3rd-party trees can be
+    # read-only) so removal does not fail with "Directory not empty".
+    local d
+    for d in "$@"; do
+        [ -d "$d" ] || continue
+        find "$d" -mindepth 1 -maxdepth 1 ! -name '_deps' -exec chmod -R u+w {} + 2>/dev/null || true
+        find "$d" -mindepth 1 -maxdepth 1 ! -name '_deps' -exec rm -rf {} + 2>/dev/null || true
+    done
+}
+
+fetchcontent_offline_flag_() {
+    # Echo the FetchContent offline flag ONLY when reconfiguring a build dir
+    # whose CMake cache was removed but whose `_deps/` was preserved (i.e. after
+    # a `clean_keep_deps`). Without it FetchContent would re-clone every
+    # dependency; with it, the preserved sources are reused. First builds and
+    # incremental builds are unaffected (a first build has no _deps; an
+    # incremental build keeps its cache, which already skips re-fetching). Use a
+    # full `clean` to force a fresh fetch.
+    if [ -d "$1/_deps" ] && [ ! -f "$1/CMakeCache.txt" ]; then
+        echo "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+    fi
+}
+
 build_local() {
     local subcommand="${1:-all}"
     local build_type="${2:-debug}"
@@ -434,6 +501,14 @@ build_local() {
     fi
 
     if [ "$subcommand" = "clean" ]; then
+        # Full wipe of build + install trees (original behaviour). Make the
+        # trees writable first so read-only 3rd-party files inside _deps do not
+        # cause "Directory not empty". Use `clean_keep_deps` to keep the
+        # downloaded _deps and avoid re-downloading on the next build.
+        chmod -R u+w ${TOP}/build-* ${TOP}/install \
+            ${TOP}/cpp/plugins/cucim.kit.cuslide/build-* ${TOP}/cpp/plugins/cucim.kit.cuslide/install \
+            ${TOP}/cpp/plugins/cucim.kit.cumed/build-* ${TOP}/cpp/plugins/cucim.kit.cumed/install \
+            ${TOP}/python/build-* ${TOP}/python/install 2>/dev/null || true
         rm -rf ${TOP}/build-*
         rm -rf ${TOP}/install
         rm -rf ${TOP}/cpp/plugins/cucim.kit.cuslide/build-*/
@@ -441,6 +516,22 @@ build_local() {
         rm -rf ${TOP}/cpp/plugins/cucim.kit.cumed/build-*/
         rm -rf ${TOP}/cpp/plugins/cucim.kit.cumed/install
         rm -rf ${TOP}/python/build-*
+        rm -rf ${TOP}/python/install
+    fi
+
+    if [ "$subcommand" = "clean_keep_deps" ]; then
+        # Like `clean` but PRESERVE each build dir's `_deps/` (FetchContent
+        # downloads) so the next build reuses them offline instead of
+        # re-downloading. Also sidesteps "Directory not empty" on read-only
+        # _deps files. Use a full `clean` after a dependency version/URL change.
+        clean_build_keep_deps_ \
+            ${TOP}/build-* \
+            ${TOP}/cpp/plugins/cucim.kit.cuslide/build-* \
+            ${TOP}/cpp/plugins/cucim.kit.cumed/build-* \
+            ${TOP}/python/build-*
+        rm -rf ${TOP}/install
+        rm -rf ${TOP}/cpp/plugins/cucim.kit.cuslide/install
+        rm -rf ${TOP}/cpp/plugins/cucim.kit.cumed/install
         rm -rf ${TOP}/python/install
     fi
 
@@ -557,6 +648,35 @@ test_python() {
         testsuite="${testsuite} ${testsuite_performance}"
     fi
 
+    # When HIPCIM_CPP_PROFILE=ON, capture C++ coverage exercised by the Python
+    # suite: pytest drives the compiled extension (cucim/clara/_cucim.so ->
+    # libhipcim.so + plugins), so profiling it captures C++ paths the C++ unit
+    # tests never reach. We point the import at the in-place build and drop the
+    # instrumented core+plugin libs into its clara/ dir so the exercised C++ is
+    # the instrumented build (bytes match install/lib, so profiles merge with
+    # the C++-test run).
+    if [ "${HIPCIM_CPP_PROFILE:-OFF}" = "ON" ]; then
+        local _pyroot _clara _core _t _p
+        _pyroot="$(ls -d ${TOP}/python/cucim/build/lib.*/ 2>/dev/null | head -1)"
+        if [ -n "${_pyroot}" ] && [ -d "${_pyroot}cucim/clara" ]; then
+            _clara="${_pyroot}cucim/clara"
+            _core="$(ls -1 ${TOP}/install/lib/libhipcim.so.*.*.* 2>/dev/null | head -1)"
+            [ -z "${_core}" ] && _core="$(ls -1 ${TOP}/install/lib/libhipcim.so 2>/dev/null | head -1)"
+            if [ -n "${_core}" ]; then
+                for _t in "${_clara}"/libhipcim.so*; do [ -f "${_t}" ] && cp -f "${_core}" "${_t}"; done
+            fi
+            for _p in ${TOP}/install/lib/hipcim.kit.*.so; do
+                [ -f "${_p}" ] && cp -f "${_p}" "${_clara}/$(basename "${_p}")"
+            done
+            export PYTHONPATH="${_pyroot}${PYTHONPATH:+:$PYTHONPATH}"
+            export LLVM_PROFILE_FILE="${TOP}/py_cov_%p_%9m.profraw"
+            rm -f ${TOP}/py_cov_*.profraw
+            c_echo G "C++ profiling ON for pytest (PYTHONPATH=${_pyroot}, LLVM_PROFILE_FILE set)"
+        else
+            c_echo Y "HIPCIM_CPP_PROFILE=ON but no importable build under python/cucim/build/lib.*; C++ profiling skipped"
+        fi
+    fi
+
     pushd $TOP/python/cucim
     run_command py.test --cache-clear -vv \
         --cov=cucim \
@@ -659,11 +779,59 @@ build_cpp_coverage() {
 
     c_echo G "Building with code coverage enabled..."
 
-    # Clean and build with coverage
-    build_local clean
+    # Clean and build with coverage. Use clean_keep_deps so repeated coverage
+    # rebuilds reuse the downloaded 3rd-party _deps instead of re-fetching them.
+    build_local clean_keep_deps
     build_local_libhipcim_ ${TOP} ${build_type} ${build_type_str} "" "ON"
-    build_local_hipslide_ ${TOP}/cpp/plugins/cucim.kit.cuslide ${build_type} ${build_type_str} ""
-    build_local_hipmed_ ${TOP}/cpp/plugins/cucim.kit.cumed ${build_type} ${build_type_str} ""
+    build_local_hipslide_ ${TOP}/cpp/plugins/cucim.kit.cuslide ${build_type} ${build_type_str} "" "ON"
+    build_local_hipmed_ ${TOP}/cpp/plugins/cucim.kit.cumed ${build_type} ${build_type_str} "" "ON"
+}
+
+coverage_full() {
+    local build_type="${1:-release}"
+    c_echo G "Full coverage: instrumented C++ build + C++ tests + pytest (C++ & Python)"
+
+    if [ -s "${TOP}/difflist.txt" ] || [ -s "${TOP}/difflist-python.txt" ]; then
+        c_echo Y "Note: difflist.txt/difflist-python.txt present -> coverage will be"
+        c_echo Y "      scoped to those diff files. Remove them for FULL (all-file) data."
+    fi
+
+    # Start from a clean set of profiles so stale runs do not leak in.
+    rm -f ${TOP}/code_cov_*.profraw ${TOP}/py_cov_*.profraw
+
+    # 1) Instrumented build (core libhipcim + cuslide/cumed plugins).
+    build_cpp_coverage "${build_type}"
+
+    # 2) Python unit suite: coverage.py (Python lines) + LLVM profiling of the
+    #    C++ extension it drives (emits py_cov_*.profraw).
+    export HIPCIM_CPP_PROFILE=ON
+    test_python unit
+    unset HIPCIM_CPP_PROFILE
+
+    # 3) C++ unit tests, then merge ALL profraw (C++ tests + pytest) into one
+    #    combined C++ report. test_cpp_coverage's profraw discovery picks up the
+    #    py_cov_*.profraw too, so no extra wiring is needed.
+    test_cpp_coverage "${build_type}"
+
+    c_echo G "Full combined coverage complete:"
+    c_echo Y "  C++ (C++ tests + pytest): ${TOP}/coverage_report/hipcim-coverage-cpp.json"
+    c_echo Y "  Python (coverage.py)    : ${TOP}/hipcim-coverage-python.json, ${TOP}/cucim-coverage.xml"
+}
+
+coverage_full_desc() { echo 'Run full combined coverage (C++ tests + pytest-driven C++ + Python)
+
+Builds instrumented C++ (core + plugins), runs the C++ unit tests and the Python
+unit suite (which drives the C++ extension) under LLVM profiling, then merges both
+profiles into a single C++ coverage report. A Python coverage.py report is produced
+too.
+
+Arguments:
+  $1 - build type [debug|release|rel-debug] (default: release)
+
+Requires an importable in-place build at python/cucim/build/lib.* (from the normal
+Python build). Produces FULL (unfiltered) reports when difflist.txt /
+difflist-python.txt are absent; if present, coverage is scoped to those diff files.
+'
 }
 
 test_cpp_coverage() {
@@ -725,6 +893,11 @@ test_cpp_coverage() {
     for lib in ${TOP}/build-${build_type}/lib/libhipcim.so ${TOP}/install/lib/libhipcim.so; do
         [ -f "$lib" ] && OBJECTS="${OBJECTS} -object=${lib}"
     done
+    # Include instrumented plugin shared libraries (cuslide/cumed) so their
+    # coverage is captured too, not just core libhipcim.
+    for plugin in ${TOP}/install/lib/hipcim.kit.*.so; do
+        [ -f "$plugin" ] && OBJECTS="${OBJECTS} -object=${plugin}"
+    done
     for exe in ${TOP}/install/bin/*tests ${TOP}/install/bin/*benchmarks; do
         [ -f "$exe" ] && OBJECTS="${OBJECTS} -object=${exe}"
     done
@@ -760,6 +933,8 @@ test_cpp_coverage() {
         --ignore-filename-regex=".*benchmark.*" \
         --ignore-filename-regex=".*third_party.*" \
         --ignore-filename-regex=".*/_deps/.*" \
+        --ignore-filename-regex=".*rocjpeg.*" \
+        --ignore-filename-regex=".*cufile.*" \
         --format=html \
         --output-dir=${TOP}/coverage_report \
         ${OBJECTS} 2>>$RUN_LOG \
@@ -773,6 +948,8 @@ test_cpp_coverage() {
         --ignore-filename-regex=".*benchmark.*"           \
         --ignore-filename-regex=".*third_party.*"         \
         --ignore-filename-regex=".*/_deps/.*"             \
+        --ignore-filename-regex=".*rocjpeg.*"             \
+        --ignore-filename-regex=".*cufile.*"              \
         ${OBJECTS} > ${TOP}/coverage_report/hipcim-coverage-cpp.json 2>>$RUN_LOG
     JSON_EXIT=$?
     if [ ${JSON_EXIT} -ne 0 ]; then
@@ -801,6 +978,8 @@ test_cpp_coverage() {
         --ignore-filename-regex=".*test.*" \
         --ignore-filename-regex=".*benchmark.*" \
         --ignore-filename-regex=".*third_party.*" \
+        --ignore-filename-regex=".*rocjpeg.*" \
+        --ignore-filename-regex=".*cufile.*" \
         ${OBJECTS} 2>>$RUN_LOG
 
     c_echo G "Coverage report generated at: ${TOP}/coverage_report/index.html"
@@ -861,6 +1040,11 @@ cpp_coverage() {
     for lib in ${TOP}/build-${build_type}/lib/libhipcim.so ${TOP}/install/lib/libhipcim.so; do
         [ -f "$lib" ] && OBJECTS="${OBJECTS} -object=${lib}"
     done
+    # Include instrumented plugin shared libraries (cuslide/cumed) so their
+    # coverage is captured too, not just core libhipcim.
+    for plugin in ${TOP}/install/lib/hipcim.kit.*.so; do
+        [ -f "$plugin" ] && OBJECTS="${OBJECTS} -object=${plugin}"
+    done
     for exe in ${TOP}/install/bin/*tests ${TOP}/install/bin/*benchmarks; do
         [ -f "$exe" ] && OBJECTS="${OBJECTS} -object=${exe}"
     done
@@ -871,6 +1055,8 @@ cpp_coverage() {
         --ignore-filename-regex=".*test.*" \
         --ignore-filename-regex=".*benchmark.*" \
         --ignore-filename-regex=".*third_party.*" \
+        --ignore-filename-regex=".*rocjpeg.*" \
+        --ignore-filename-regex=".*cufile.*" \
         --format=html \
         --output-dir=coverage_report \
         ${OBJECTS}
@@ -882,6 +1068,8 @@ cpp_coverage() {
         --ignore-filename-regex=".*test.*" \
         --ignore-filename-regex=".*benchmark.*" \
         --ignore-filename-regex=".*third_party.*" \
+        --ignore-filename-regex=".*rocjpeg.*" \
+        --ignore-filename-regex=".*cufile.*" \
         ${OBJECTS}
 
     c_echo G "Coverage report generated at: ${TOP}/coverage_report/index.html"
@@ -940,8 +1128,43 @@ update_version() {
     return $ret
 }
 
+generate_difflists_() {
+    # Generate difflist.txt (C++) and difflist-python.txt (Python) from the diff
+    # between <ref> and HEAD, so coverage commands scope their reports to the
+    # changed (AMD-delta) files. Consumed by test_cpp_coverage / test_python /
+    # coverage_full. Remove the difflists for full, unscoped coverage.
+    local base_ref="${1}"
+    if ! git -C "${TOP}" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+        c_echo_err R "--diff: ref '${base_ref}' not found locally. Fetch it first, e.g.:"
+        c_echo_err R "  git fetch https://github.com/rapidsai/cucim.git refs/tags/${base_ref}:refs/tags/${base_ref}"
+        exit 1
+    fi
+    c_echo G "Scoping coverage to diff: ${base_ref}...HEAD"
+    git -C "${TOP}" diff --name-only --diff-filter=AM "${base_ref}...HEAD" \
+        | grep -E '\.(cpp|h|cu|cuh)$' > "${TOP}/difflist.txt" || true
+    git -C "${TOP}" diff --name-only --diff-filter=AM "${base_ref}...HEAD" \
+        | grep 'python/cucim/src' | grep -v '/tests/' | grep -v '/test_' \
+        | grep -E '\.py$' > "${TOP}/difflist-python.txt" || true
+    c_echo Y "  C++ diff files:    $(wc -l < "${TOP}/difflist.txt")"
+    c_echo Y "  Python diff files: $(wc -l < "${TOP}/difflist-python.txt")"
+}
+
 parse_args() {
     local OPTIND
+    DIFF_REF=""
+    # Extract the global `--diff <ref>` option (a long option; the getopts loop
+    # below only handles single-char flags). When set, coverage runs are scoped
+    # to files changed between <ref> and HEAD. Everything else is passed through.
+    local _passthru=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --diff)   DIFF_REF="${2:?--diff requires a commit id or tag}"; shift 2 ;;
+            --diff=*) DIFF_REF="${1#--diff=}"; shift ;;
+            *)        _passthru+=("$1"); shift ;;
+        esac
+    done
+    set -- "${_passthru[@]}"
+
     while getopts 'yh' option;
     do
         case "${option}" in
@@ -973,6 +1196,7 @@ print_usage() {
     echo_err "USAGE: $0 [command] [arguments]..."
     echo_err ""
     c_echo_err W "Global Arguments"
+    c_echo_err Y "    --diff <ref> " w "-------------------  Scope coverage (test_cpp_coverage/test_python/coverage_full) to files changed vs <ref> (commit/tag)"
     echo_err
     c_echo_err W "Command List"
     c_echo_err Y "    help  " w "----------------------------  Print detailed description for a given argument (command name)"
@@ -1074,6 +1298,10 @@ install_dependencies() {
 main() {
     local ret=0
     parse_args "$@"
+
+    if [ -n "${DIFF_REF:-}" ]; then
+        generate_difflists_ "${DIFF_REF}"
+    fi
 
     case "$CMD" in
         install_deps)

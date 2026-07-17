@@ -17,6 +17,8 @@ omit =
     */cucim/time.py
     */cucim/_misc.py
     */cucim/clara/cli.py
+    # omit test files (they are not source under measurement)
+    */tests/*
 
 [paths]
 source =
