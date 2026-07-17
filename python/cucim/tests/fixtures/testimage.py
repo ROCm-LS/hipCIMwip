@@ -47,11 +47,32 @@ def testimg_tiff_stripe_32x24_16_raw(tmpdir_factory):
     shutil.rmtree(dataset_path)
 
 
+@pytest.fixture(scope="session")
+def testimg_tiff_stripe_32x24_16_lzw(tmpdir_factory):
+    dataset_path, image_path = gen_image(
+        tmpdir_factory, "tiff::stripe:32x24:16:lzw"
+    )
+    yield image_path
+    # Clean up fake dataset folder
+    shutil.rmtree(dataset_path)
+
+
+@pytest.fixture(scope="session")
+def testimg_tiff_stripe_32x24_16_lzw_predictor(tmpdir_factory):
+    dataset_path, image_path = gen_image(
+        tmpdir_factory, "tiff::stripe:32x24:16:lzw_predictor"
+    )
+    yield image_path
+    # Clean up fake dataset folder
+    shutil.rmtree(dataset_path)
+
+
 @pytest.fixture(
     scope="session",
     params=[
         lazy_fixture("testimg_tiff_stripe_32x24_16_jpeg"),
         lazy_fixture("testimg_tiff_stripe_32x24_16_deflate"),
+        lazy_fixture("testimg_tiff_stripe_32x24_16_lzw"),
         lazy_fixture("testimg_tiff_stripe_32x24_16_raw"),
     ],
 )

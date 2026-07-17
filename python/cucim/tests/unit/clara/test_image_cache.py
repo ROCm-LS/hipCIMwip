@@ -187,10 +187,15 @@ def test_reserve_more_cache_memory():
     assert cache.miss_count == 0
 
 
-@pytest.mark.skip(reason="currently fails (gh-626)")
 def test_cache_hit_miss(testimg_tiff_stripe_32x24_16_jpeg):
     from cucim import CuImage
     from cucim.clara.cache import preferred_memory_capacity
+
+    # Reset to a known (empty) cache first so the hit/miss counts below do not
+    # depend on cache state left over from earlier tests. gh-626 tracked an
+    # isolation-order failure of this test; starting from "no_cache" makes it
+    # deterministic regardless of execution order.
+    CuImage.cache("no_cache")
 
     img = CuImage(testimg_tiff_stripe_32x24_16_jpeg)
     memory_capacity = preferred_memory_capacity(img, patch_size=(16, 16))
@@ -229,3 +234,39 @@ def test_cache_hit_miss(testimg_tiff_stripe_32x24_16_jpeg):
     assert cache.free_memory == 0
     assert cache.size == 0
     assert cache.capacity == 0
+
+
+def test_cache_eviction(testimg_tiff_stripe_4096x4096_256_jpeg):
+    import numpy as np
+
+    from cucim import CuImage
+
+    # Start from a clean cache so counts are independent of execution order.
+    CuImage.cache("no_cache")
+
+    img = CuImage(testimg_tiff_stripe_4096x4096_256_jpeg)
+    tile_width, tile_height = img.resolutions["level_tile_sizes"][0]
+    width, _ = img.size("XY")
+
+    # A 1 MiB per-process cache holds only a handful of tiles, so reading more
+    # distinct tiles than it can hold forces least-recently-used eviction
+    # (exercises remove_front()/erase() in the per-process cache).
+    cache = CuImage.cache("per_process", memory_capacity=1, record_stat=True)
+    capacity = cache.capacity
+    assert capacity > 0
+
+    num_reads = capacity + 6
+    for i in range(num_reads):
+        x = (i * tile_width) % width
+        y = ((i * tile_width) // width) * tile_height
+        np.asarray(img.read_region((x, y), (tile_width, tile_height)))
+
+    # Every distinct tile missed, and the cache never grew past its capacity,
+    # so older entries must have been evicted.
+    assert cache.hit_count == 0
+    assert cache.miss_count >= num_reads
+    assert 0 < cache.size <= capacity
+    assert cache.memory_size <= cache.memory_capacity
+
+    # Reset the global cache so later tests start from a known state.
+    CuImage.cache("no_cache")
