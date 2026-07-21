@@ -11,6 +11,7 @@
 
 #include <fmt/format.h>
 
+#include "cucim/memory/memory_manager.h"
 #include "cucim/profiler/nvtx3.h"
 #include "cucim/util/cuda.h"
 #include <cucim/cuda_runtime.h>
@@ -30,6 +31,7 @@ ThreadBatchDataLoader::ThreadBatchDataLoader(LoadFunc load_func,
                                              const uint32_t num_workers)
     : load_func_(load_func),
       out_device_(out_device),
+      output_device_(out_device),
       location_(std::move(location)),
       image_size_(std::move(image_size)),
       location_len_(location_len),
@@ -271,6 +273,22 @@ uint32_t ThreadBatchDataLoader::wait_batch()
 }
 
 
+uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster)
+{
+    // When tiles were decoded on the host but a CUDA output was requested, copy
+    // the raster onto the output device so callers always receive a buffer that
+    // lives there (see set_output_device()). move_raster_from_host() frees the
+    // host buffer and returns the device allocation.
+    if (raster != nullptr && out_device_.type() == cucim::io::DeviceType::kCPU &&
+        output_device_.type() == cucim::io::DeviceType::kCUDA)
+    {
+        void* staged = raster;
+        cucim::memory::move_raster_from_host(&staged, buffer_size_, output_device_);
+        raster = static_cast<uint8_t*>(staged);
+    }
+    return raster;
+}
+
 uint8_t* ThreadBatchDataLoader::next_data()
 {
 #ifdef DEBUG
@@ -287,6 +305,8 @@ uint8_t* ThreadBatchDataLoader::next_data()
         // by setting it to nullptr so that it will not be freed by ~ThreadBatchDataLoader (destructor).
         uint8_t* batch_raster_ptr = raster_data_[0];
         raster_data_[0] = nullptr;
+        batch_raster_ptr = stage_to_output_device_(batch_raster_ptr);
+        current_data_ = batch_raster_ptr;
         return batch_raster_ptr;
     }
 
@@ -336,6 +356,7 @@ uint8_t* ThreadBatchDataLoader::next_data()
 
     buffer_item_head_index_ = (buffer_item_head_index_ + 1) % buffer_item_len_;
 
+    batch_raster_ptr = stage_to_output_device_(batch_raster_ptr);
     current_data_ = batch_raster_ptr;
     current_data_batch_size_ =
         std::min(location_len_ - (processed_batch_count_ * batch_size_), static_cast<uint64_t>(batch_size_));

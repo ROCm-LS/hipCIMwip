@@ -64,12 +64,26 @@ public:
     uint8_t* data() const;
     uint32_t data_batch_size() const;
 
+    /// Set the device the loaded rasters should ultimately reside on. When it
+    /// differs from the decode device, next_data() stages each raster onto it
+    /// before returning it, so data()/next_data() always hand out buffers that
+    /// live on the output device.
+    void set_output_device(const cucim::io::Device& device)
+    {
+        output_device_ = device;
+    }
+
     bool enqueue(std::function<void()> task, const TileInfo& tile);
 
 private:
+    // Stage a host-decoded raster onto output_device_ when it differs from the
+    // decode device (out_device_). Returns the buffer to expose.
+    uint8_t* stage_to_output_device_(uint8_t* raster);
+
     bool stopped_ = false;
     LoadFunc load_func_;
     cucim::io::Device out_device_;
+    cucim::io::Device output_device_;
     std::unique_ptr<std::vector<int64_t>> location_ = nullptr;
     std::unique_ptr<std::vector<int64_t>> image_size_ = nullptr;
     uint64_t location_len_ = 0;

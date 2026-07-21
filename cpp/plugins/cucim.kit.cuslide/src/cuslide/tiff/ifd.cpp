@@ -318,6 +318,11 @@ bool IFD::read(const TIFF* tiff,
                 load_func, std::move(batch_processor), loader_out_device, std::move(request_location),
                 std::move(request_size), location_len, one_raster_size, batch_size, prefetch_factor, num_workers);
 
+            // The loader may decode on the host (loader_out_device) even when the
+            // caller requested CUDA output; give it the final output device so it
+            // stages each raster there before handing it out.
+            loader->set_output_device(out_device);
+
             const uint32_t load_size = std::min(static_cast<uint64_t>(batch_size) * (1 + prefetch_factor), location_len);
 
             loader->request(load_size);
@@ -447,8 +452,12 @@ bool IFD::read(const TIFF* tiff,
         shape[3] = n_ch;
     }
 
-    // Copy the raster memory and free it if needed.
-    if (!is_buf_available && raster && raster_type == cucim::io::DeviceType::kCPU)
+    // Copy the raster memory and free it if needed. When a loader is present it
+    // has already staged the raster onto the output device (see
+    // ThreadBatchDataLoader::set_output_device), so only stage here for the
+    // direct, loader-less single-tile path.
+    if (!is_buf_available && raster && raster_type == cucim::io::DeviceType::kCPU &&
+        !out_image_data->loader)
     {
         cucim::memory::move_raster_from_host(&raster, raster_size, out_device);
     }

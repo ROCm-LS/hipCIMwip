@@ -228,6 +228,87 @@ def test_cuda_array_interface_support(testimg_tiff_stripe_32x24_16_jpeg):
     assert array_interface["stream"] == 1
 
 
+def test_cuda_read_region_returns_device_memory(tmp_path):
+    """Regression test: ``read_region(device="cuda")`` must expose device memory.
+
+    Compressions without a GPU batch decoder (e.g. uncompressed / LZW) are
+    decoded on the host and then staged to the GPU. The staged device pointer,
+    not the intermediate (and subsequently freed) host buffer, must be the one
+    exposed through ``__cuda_array_interface__`` so the result is usable as CUDA
+    memory. Previously the host pointer leaked through and consuming it raised
+    ``CUDARuntimeError: invalid device ordinal``.
+    """
+    cp = pytest.importorskip("cupy")
+    tifffile = pytest.importorskip("tifffile")
+
+    if cp.cuda.runtime.getDeviceCount() < 1:
+        pytest.skip("no CUDA device available")
+
+    # Uncompressed, tiled image -> host-decode + device-staging path.
+    expected = np.arange(512 * 512 * 3, dtype=np.uint8).reshape(512, 512, 3) % 251
+    file_path = str(tmp_path / "raw_tiled.tif")
+    tifffile.imwrite(
+        file_path, expected, tile=(256, 256), photometric="rgb", compression=None
+    )
+
+    img = open_image_cucim(file_path)
+    region = img.read_region((0, 0), (256, 256), device="cuda:0")
+
+    # The exposed pointer must reside on the device, like a genuine cupy
+    # allocation -- not a host buffer mislabelled as CUDA memory.
+    ptr = region.__cuda_array_interface__["data"][0]
+    device_mem_type = cp.cuda.runtime.pointerGetAttributes(
+        int(cp.zeros(1, cp.uint8).data.ptr)
+    ).type
+    assert cp.cuda.runtime.pointerGetAttributes(ptr).type == device_mem_type
+
+    # It must round-trip through cupy and match the host read.
+    gpu_region = cp.asarray(region)
+    host_region = np.asarray(img.read_region((0, 0), (256, 256)))
+    np.testing.assert_array_equal(cp.asnumpy(gpu_region), host_region)
+
+
+def test_cuda_batched_read_returns_device_memory(tmp_path):
+    """Regression test: batched/iterated ``read_region(device="cuda")``.
+
+    The batch iterator advances through the loader's ``next_data()``; every batch
+    it yields must live on the output device, not on the host decode buffer. This
+    path is separate from the single-region read and regressed independently.
+    """
+    cp = pytest.importorskip("cupy")
+    tifffile = pytest.importorskip("tifffile")
+
+    if cp.cuda.runtime.getDeviceCount() < 1:
+        pytest.skip("no CUDA device available")
+
+    expected = np.arange(512 * 512 * 3, dtype=np.uint8).reshape(512, 512, 3) % 251
+    file_path = str(tmp_path / "raw_tiled.tif")
+    tifffile.imwrite(
+        file_path, expected, tile=(256, 256), photometric="rgb", compression=None
+    )
+
+    device_mem_type = cp.cuda.runtime.pointerGetAttributes(
+        int(cp.zeros(1, cp.uint8).data.ptr)
+    ).type
+
+    locations = [(0, 0), (256, 0)]
+    batches = open_image_cucim(file_path).read_region(
+        locations, (256, 256), num_workers=1, batch_size=1, device="cuda"
+    )
+
+    seen = 0
+    for i, region in enumerate(batches):
+        ptr = region.__cuda_array_interface__["data"][0]
+        assert cp.cuda.runtime.pointerGetAttributes(ptr).type == device_mem_type
+        gpu = cp.asnumpy(cp.asarray(region))
+        host = np.asarray(
+            open_image_cucim(file_path).read_region(locations[i], (256, 256))
+        )
+        np.testing.assert_array_equal(gpu, host)
+        seen += 1
+    assert seen == len(locations)
+
+
 def test_tiff_iterator(testimg_tiff_stripe_4096x4096_256):
     """Test that the iterator of read_region works as expected.
     See issue gh-592: https://github.com/rapidsai/cucim/issues/592
