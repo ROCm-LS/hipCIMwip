@@ -25,7 +25,6 @@ import numpy
 import pytest
 
 import cupy
-from cupy.cuda import runtime
 from cupy import testing
 import cucim.skimage._vendored.ndimage as vendored_ndimage
 from cucim.skimage._vendored._internal import AxisError
@@ -77,12 +76,6 @@ def test_zoom_shift_grid_codegen_indexes_shift_by_axis():
 
 
 def test_loop_batch_selected_when_last_axis_is_one_of_multiple_batch_axes():
-    if runtime.is_hip:
-        pytest.skip(
-            "loop_batch_axis optimization is disabled on HIP "
-            "(loop_batch_max_channels=0) to avoid an integer-output codegen "
-            "bug, so the looped batch kernel is never selected on AMD GPUs."
-        )
     kern_info = _get_shift_kernel(
         4,
         False,
@@ -823,13 +816,6 @@ def test_affine_transform_cross_term_from_last_axis_is_not_batch_axis():
 
 
 def test_map_coordinates_batch_axes_use_same_spatial_map_for_all_channels():
-    if runtime.is_hip:
-        pytest.skip(
-            "This test relies on the looped batch path using only channel 0's "
-            "spatial map. The loop_batch_axis optimization is disabled on HIP "
-            "(loop_batch_max_channels=0), so the non-looped path applies each "
-            "channel's own coordinates instead."
-        )
     a = testing.shaped_random((5, 6, 3), cupy, cupy.float32, scale=1)
     coordinates = cupy.indices(a.shape, dtype=cupy.float32)
     coordinates[0] += 0.2

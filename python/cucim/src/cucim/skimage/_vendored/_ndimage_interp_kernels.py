@@ -34,15 +34,7 @@ spline_weights_inline = _spline_kernel_weights.spline_weights_inline
 
 # Empirical threshold above which using loop_batch_axis=True begins to become
 # disadvantageous.
-# On AMD GPUs (HIP), the loop_batch_axis kernel path produces incorrect integer
-# output for batch sizes 4 and 8. The float accumulation is correct but the
-# (Y)rint(...) output write to raw unsigned char array corrupts specific
-# channels. Root cause is under investigation (possible HIPRTC codegen issue
-# with byte stores to CArray<unsigned char> via manual indexing).
-if cupy.cuda.runtime.is_hip:
-    loop_batch_max_channels = 0
-else:
-    loop_batch_max_channels = 12
+loop_batch_max_channels = 12
 
 
 def _get_coord_map(
@@ -560,7 +552,9 @@ def _generate_loop_batch_output_write(
     value, integer_output, float_type, indent="                "
 ):
     if integer_output:
-        value = f"(Y)rint(({float_type})({value}))"
+        # Narrow through a 64-bit int: an out-of-range double -> small-int cast
+        # is undefined behavior.
+        value = f"(Y)(long long)rint(({float_type})({value}))"
     else:
         value = f"(Y)({value})"
     return f"{indent}y[out_base_idx + batch_idx] = {value};"
@@ -980,7 +974,7 @@ def _generate_interp_custom(
                     f"""
             #pragma unroll 4
             for ({uint_t} batch_idx = 0; batch_idx < batch_size; batch_idx++) {{
-                y[out_base_idx + batch_idx] = (Y)rint(({float_type})out_batch[batch_idx]);
+                y[out_base_idx + batch_idx] = (Y)(long long)rint(({float_type})out_batch[batch_idx]);
             }}"""
                 )
             else:
@@ -1164,7 +1158,7 @@ def _generate_interp_custom(
                     f"""
             #pragma unroll 4
             for ({uint_t} batch_idx = 0; batch_idx < batch_size; batch_idx++) {{
-                y[out_base_idx + batch_idx] = (Y)rint(({float_type})out_batch[batch_idx]);
+                y[out_base_idx + batch_idx] = (Y)(long long)rint(({float_type})out_batch[batch_idx]);
             }}"""
                 )
             else:
@@ -1228,7 +1222,9 @@ def _generate_interp_custom(
     # Output writing (for non-looped cases - looped cases write inside their batch loops)
     if not loop_batch_axis:
         if integer_output:
-            ops.append(f"y = (Y)rint(({float_type})out);")
+            # Narrow through a 64-bit int: an out-of-range double -> small-int
+            # cast is undefined behavior.
+            ops.append(f"y = (Y)(long long)rint(({float_type})out);")
         else:
             ops.append("y = (Y)out;")
     operation = "\n".join(ops)
