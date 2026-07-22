@@ -1,1 +1,13 @@
 input/*.svs
+
+# Vendor whole-slide images downloaded on demand by download_test_data.sh
+# (OpenSlide test set). Large binaries, fetched into test_data/private/ and not
+# committed. README.md / LICENSE-3rdparty in that folder stay tracked.
+private/*.svs
+private/*.tif
+private/*.tiff
+
+# Synthetic fixtures produced by gen_images.sh / gen_medical.py. These are
+# regenerated on demand (e.g. by run_amd before the C++ tests) and must not be
+# committed. The generator scripts themselves live in test_data/ and stay tracked.
+generated/

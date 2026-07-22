@@ -19,6 +19,10 @@ add_executable(cucim_tests
         test_read_region.cpp
         test_cufile.cpp
         test_metadata.cpp
+        test_cuimage.cpp
+        test_image_cache.cpp
+        test_medical.cpp
+        test_memory.cpp
         )
 
 set_target_properties(cucim_tests

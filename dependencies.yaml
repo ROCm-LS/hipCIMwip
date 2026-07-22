@@ -317,7 +317,9 @@ dependencies:
     common:
       - output_types: [conda, requirements, pyproject]
         packages:
+          - nibabel>=5.0.0 # generates NIfTI fixtures for the cumed C++ tests
           - psutil>=5.8.0
+          - pydicom>=2.3.0 # generates DICOM fixtures for the cumed C++ tests
           - pytest>=7.0.0,<9.0.0
           - pytest-cov>=2.12.1
           - pytest-lazy-fixtures>=1.0.0

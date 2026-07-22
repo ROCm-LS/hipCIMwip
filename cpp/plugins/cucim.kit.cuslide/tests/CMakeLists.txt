@@ -21,6 +21,8 @@ add_executable(cuslide_tests
         test_philips_tiff.cpp
         test_rocjpeg_jpegtables.cpp
         test_ifd_sort.cpp
+        test_tiff_ifd.cpp
+        test_vendor_slides.cpp
         )
 set_target_properties(cuslide_tests
     PROPERTIES

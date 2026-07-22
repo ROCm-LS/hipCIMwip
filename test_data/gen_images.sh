@@ -22,3 +22,7 @@ generate_image() {
 
 generate_image tiff::stripe:32x32:16 tiff_stripe_32x32_16.tif
 generate_image tiff::stripe:4096x4096:256:deflate tiff_stripe_4096x4096_256.tif
+
+# Synthetic NIfTI/DICOM fixtures for the cumed (MedicalImage) C++ tests. The
+# generator has per-file guards and no-ops if nibabel/pydicom are unavailable.
+python3 ${TOP}/test_data/gen_medical.py --dest ${DEST_FOLDER}/medical

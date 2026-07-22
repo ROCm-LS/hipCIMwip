@@ -732,8 +732,25 @@ test_cpp() {
 		c_echo Y "Coverage profiling enabled - output to ${TOP}/*.profraw"
 	fi
 
-	# generate test images
-	# source  test_data/gen_images.sh
+	# Generate synthetic fixtures (TIFF stripes + NIfTI/DICOM volumes); idempotent
+	# and best-effort (skips if optional deps are missing).
+	bash "${TOP}/test_data/gen_images.sh" || \
+		c_echo Y "[WARN] gen_images.sh failed; some data-driven tests may be skipped"
+	# Fetch vendor slides for the cuslide tests (best-effort, size-validated cache;
+	# tier via CUCIM_TESTDATA_TIER). CUCIM_TESTDATA_DIR can point at a persistent
+	# cache; when set, link the slides into test_data/private where the tests look.
+	local priv_dir="${TOP}/test_data/private"
+	local cache_dir="${CUCIM_TESTDATA_DIR:-${priv_dir}}"
+	CUCIM_TESTDATA_DIR="${cache_dir}" bash "${TOP}/test_data/download_test_data.sh" || \
+		c_echo Y "[WARN] download_test_data.sh failed; vendor-slide tests may be skipped"
+	if [ "${cache_dir}" != "${priv_dir}" ]; then
+		mkdir -p "${priv_dir}"
+		for f in "${cache_dir}"/*.svs "${cache_dir}"/*.tif "${cache_dir}"/*.tiff; do
+			if [ -f "${f}" ]; then
+				ln -sf "${f}" "${priv_dir}/$(basename "${f}")"
+			fi
+		done
+	fi
 	cd ${bin_dir}
 	# link test data folder for source images
 	ln -sf ../../test_data .
