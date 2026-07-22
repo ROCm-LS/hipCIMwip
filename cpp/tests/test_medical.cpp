@@ -11,11 +11,39 @@
 
 #include "config.h"
 #include "cucim/cuimage.h"
+#include "cucim/memory/dlpack.h"
 
 // Reads generated NIfTI/DICOM fixtures through cucim::CuImage (which loads the
 // cumed plugin) to cover cumed.cpp/nifti.h/dicom.h -- header parsing, datatype
 // mapping, metadata construction and the raw voxel read path -- none of which
 // the Python suite reaches. Fixtures come from gen_medical.py (via gen_images.sh).
+
+namespace
+{
+// A correct decode yields a raster that is neither empty nor uniform (the
+// fixtures carry varied, non-zero voxels), catching a blank/zeroed buffer that
+// the shape/dtype checks alone would accept.
+bool region_has_content(cucim::CuImage& region)
+{
+    const cucim::memory::DLTContainer container = region.container();
+    DLTensor* handle = static_cast<DLTensor*>(container);
+    if (handle == nullptr || handle->data == nullptr)
+    {
+        return false;
+    }
+    const size_t n = container.size();
+    const auto* p = static_cast<const uint8_t*>(handle->data);
+    const uint8_t first = (n > 0) ? p[0] : 0;
+    bool nonzero = false;
+    bool varied = false;
+    for (size_t i = 0; i < n && !(nonzero && varied); ++i)
+    {
+        nonzero = nonzero || (p[i] != 0);
+        varied = varied || (p[i] != first);
+    }
+    return nonzero && varied;
+}
+} // namespace
 
 SCENARIO("cumed parses NIfTI volumes", "[test_medical.cpp]")
 {
@@ -67,6 +95,7 @@ SCENARIO("cumed parses NIfTI volumes", "[test_medical.cpp]")
                 REQUIRE(rshape[1] == 64);
                 REQUIRE(rshape[2] == 64);
                 REQUIRE(region.dtype().bits == 8);
+                REQUIRE(region_has_content(region));
             }
         }
     }
@@ -122,6 +151,7 @@ SCENARIO("cumed parses uncompressed DICOM images", "[test_medical.cpp]")
                 REQUIRE(rshape[0] == 64);
                 REQUIRE(rshape[1] == 64);
                 REQUIRE(region.dtype().bits == 16);
+                REQUIRE(region_has_content(region));
             }
         }
     }
@@ -147,6 +177,7 @@ SCENARIO("cumed parses uncompressed DICOM images", "[test_medical.cpp]")
             REQUIRE(region.is_loaded());
             const cucim::Shape rshape = region.shape();
             REQUIRE(rshape[2] == 3);
+            REQUIRE(region_has_content(region));
         }
     }
 }

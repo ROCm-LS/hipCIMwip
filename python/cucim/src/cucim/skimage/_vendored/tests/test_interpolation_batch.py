@@ -89,6 +89,42 @@ def test_loop_batch_selected_when_last_axis_is_one_of_multiple_batch_axes():
     assert kern_info.size == 5 * 6 * 7
 
 
+@pytest.mark.parametrize("dtype", [numpy.uint8, numpy.int16])
+@pytest.mark.parametrize("batch_size", [3, 4, 5, 8])
+@pytest.mark.parametrize("order", [1, 3])
+def test_loop_batch_integer_output_matches_per_channel(dtype, batch_size, order):
+    """Regression for the loop_batch_axis integer-output codegen bug.
+
+    Narrowing an out-of-range double straight to a small integer type is
+    undefined behaviour and corrupted specific channels for batch sizes 4 and 8.
+    The contiguous last axis (size <= loop_batch_max_channels) selects the looped
+    path, and a cubic order overshoots the input range so the narrowing sees
+    out-of-range values. The batched result must match shifting each channel
+    independently.
+    """
+    assert batch_size <= loop_batch_max_channels
+    # (H, W, C): the contiguous last axis is the batch axis (shift 0 there).
+    a = testing.shaped_random((40, 48, batch_size), cupy, dtype, scale=255)
+    shift_val = (1.7, -2.3, 0)
+
+    result = vendored_ndimage.shift(
+        a, shift_val, order=order, mode="constant", cval=0
+    )
+    expected = cupy.stack(
+        [
+            vendored_ndimage.shift(
+                a[..., i], shift_val[:2], order=order, mode="constant", cval=0
+            )
+            for i in range(batch_size)
+        ],
+        axis=-1,
+    )
+
+    assert result.dtype == a.dtype
+    # +/-1 tolerance for the rint() boundary on integer output.
+    cupy.testing.assert_allclose(result, expected, rtol=0, atol=1)
+
+
 @testing.parameterize(
     *(
         testing.product(

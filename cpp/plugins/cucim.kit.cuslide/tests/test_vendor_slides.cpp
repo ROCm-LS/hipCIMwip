@@ -52,8 +52,22 @@ void read_slide_region(const std::string& path, int64_t width, int64_t height)
     tif->read(&metadata.desc(), &request, &image_data);
     REQUIRE(image_data.container.data != nullptr);
 
-    // Associated images (label/macro/thumbnail): best-effort into a separate
-    // buffer; ignore slides that lack a given image.
+    // A correct decode yields non-zero pixels; this catches a blank (zeroed)
+    // raster that the pointer check alone would accept. Vendor slides are RGB
+    // 8-bit, so the region is width*height*3 bytes (the low-level test metadata
+    // carries no dtype, so the size is computed directly).
+    {
+        const size_t n = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
+        const auto* bytes = static_cast<const uint8_t*>(image_data.container.data);
+        bool nonzero = false;
+        for (size_t i = 0; i < n && !nonzero; ++i)
+        {
+            nonzero = (bytes[i] != 0);
+        }
+        REQUIRE(nonzero);
+    }
+
+    // Associated images (label/macro/thumbnail): best-effort, separate buffer.
     for (const char* name : { "label", "macro", "thumbnail" })
     {
         try
