@@ -62,9 +62,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN NO)
 
-# Set RPATH
+# Resolve the ROCm root dynamically (ROCM_PATH env > ROCM_HOME env > hipcc > /opt/rocm).
+if(DEFINED ENV{ROCM_PATH})
+    set(ROCM_PATH "$ENV{ROCM_PATH}")
+elseif(DEFINED ENV{ROCM_HOME})
+    set(ROCM_PATH "$ENV{ROCM_HOME}")
+else()
+    find_program(HIPCC_EXECUTABLE hipcc)
+    if(HIPCC_EXECUTABLE)
+        get_filename_component(_hipcc_bin "${HIPCC_EXECUTABLE}" DIRECTORY)
+        get_filename_component(ROCM_PATH "${_hipcc_bin}" DIRECTORY)
+    else()
+        set(ROCM_PATH "/opt/rocm")
+    endif()
+endif()
+
+# Set RPATH so libraries resolve their ROCm dependencies across install layouts
+# (pip/venv wheels via $ORIGIN, build-time ROCm root, and system /opt/rocm).
+set(HIPCIM_RPATH "$ORIGIN;$ORIGIN/../../_rocm_sdk_core/lib;$ORIGIN/../../_rocm_sdk_libraries/lib;$ORIGIN/../../_rocm_sdk_devel/lib;${ROCM_PATH}/lib;/opt/rocm/lib")
 if (NOT APPLE)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN;/opt/rocm/lib")
+    set(CMAKE_INSTALL_RPATH "${HIPCIM_RPATH}")
 endif()
 
 # Set Installation setup
@@ -127,7 +144,7 @@ endif()
 
 # Note: On CentOS, if we do not set MAKE_BUILD_RPATH to $ORIGIN, installed library also do not have $ORIGIN in RPATH.
 #       The following is same with `set(CMAKE_BUILD_RPATH_USE_ORIGIN TRUE)`.
-set(CMAKE_BUILD_RPATH "$ORIGIN;/opt/rocm/lib")
+set(CMAKE_BUILD_RPATH "${HIPCIM_RPATH}")
 
 
 ################################################################################

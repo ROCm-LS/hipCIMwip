@@ -5,6 +5,18 @@
 
 import os
 
+# Preload ROCm shared libraries before importing any native extension so that
+# hipCIM resolves its ROCm dependencies regardless of where ROCm is installed
+# (pip/venv wheels vs. a system /opt/rocm). No-op if the rocm-sdk package is
+# not present.
+try:
+    from . import _rocm_init
+except ModuleNotFoundError:
+    pass
+else:
+    _rocm_init.initialize()
+    del _rocm_init
+
 from . import cli, converter
 
 # import hidden methods

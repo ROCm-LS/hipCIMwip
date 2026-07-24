@@ -23,6 +23,22 @@ init_globals() {
             export GCC_TOOLCHAIN_ROOT=$(dirname "$(dirname "${_gcc_path}")")
         fi
     fi
+
+    # Resolve the ROCm root dynamically so the hardcoded /opt/rocm is only a last
+    # resort. Order: ROCM_PATH > ROCM_HOME > `rocm-sdk path --root` > `hipcc`
+    # location > /opt/rocm. Covers pip/venv (TheRock), tarball and system installs.
+    if [ -z "${ROCM_PATH:-}" ]; then
+        if [ -n "${ROCM_HOME:-}" ]; then
+            ROCM_PATH="${ROCM_HOME}"
+        elif command -v rocm-sdk >/dev/null 2>&1; then
+            ROCM_PATH="$(rocm-sdk path --root 2>/dev/null || true)"
+        fi
+    fi
+    if [ -z "${ROCM_PATH:-}" ] && command -v hipcc >/dev/null 2>&1; then
+        ROCM_PATH="$(dirname "$(dirname "$(command -v hipcc)")")"
+    fi
+    [ -z "${ROCM_PATH:-}" ] && ROCM_PATH="/opt/rocm"
+    export ROCM_PATH
 }
 
 ################################################################################
@@ -273,8 +289,8 @@ build_local_libhipcim_() {
 
     pushd ${source_folder} > /dev/null
 
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # If coverage is enabled, ensure both C and C++ use hipcc
     local c_compiler_flag=""
@@ -337,8 +353,8 @@ build_local_hipslide_() {
     local CMAKE_CMD=${CMAKE_CMD:-cmake}
 
     pushd ${source_folder} > /dev/null
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
@@ -382,8 +398,8 @@ build_local_hipmed_() {
 
     pushd ${source_folder} > /dev/null
 
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
@@ -481,7 +497,7 @@ build_local() {
     local subcommand="${1:-all}"
     local build_type="${2:-debug}"
     local build_type_str="Debug"
-    local prefix=${3:-}
+    local prefix=${3:-${ROCM_PATH:-/opt/rocm}}
 
     local major_version="$(cat ${TOP}/HIPCIM_VERSION | cut -d. -f1)" # major version number
 
@@ -1274,7 +1290,7 @@ install_cupy() {
 
     echo "Setting up environment for CuPy build..."
     export CUPY_INSTALL_USE_HIP=1
-    export ROCM_HOME=/opt/rocm
+    export ROCM_HOME=${ROCM_PATH:-/opt/rocm}
     export HCC_AMDGPU_TARGET=${AMDGPU_TARGETS//;/,}
 
     echo "Building CuPy wheel..."
