@@ -4,7 +4,7 @@
 
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-TOP="$(git rev-parse --show-toplevel 2> /dev/null || echo "${SCRIPT_DIR}")"
+TOP="$(git rev-parse --show-toplevel 2> /dev/null || echo "${SCRIPT_DIR}/..")"
 
 [ -z "${TOP}" ] && >&2 echo "Repository root is not available!" && exit 1
 

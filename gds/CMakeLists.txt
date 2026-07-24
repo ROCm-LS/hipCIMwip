@@ -15,7 +15,7 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
 find_package(HIP REQUIRED)
 enable_language(HIP)
 include_directories(${HIP_INCLUDE_DIRS})
-set(FMT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/deps-fmt-src/include")
+set(FMT_INCLUDE_DIR "${deps-fmt_SOURCE_DIR}/include")
 
 # Find and enable HIP
 find_package(HIP REQUIRED)
@@ -23,7 +23,7 @@ enable_language(HIP)
 include_directories(${HIP_INCLUDE_DIRS})
 
 # Set FMT include directory
-set(FMT_INCLUDE_DIR "${CMAKE_BINARY_DIR}/_deps/deps-fmt-src/include")
+set(FMT_INCLUDE_DIR "${deps-fmt_SOURCE_DIR}/include")
 
 # Set RPATH
 if (NOT APPLE)

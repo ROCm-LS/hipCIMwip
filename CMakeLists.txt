@@ -26,13 +26,15 @@ set(PROJECT_VERSION_BUILD dev)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cpp/cmake/modules")
 project(libcucim VERSION ${VERSION} DESCRIPTION "libcucim" LANGUAGES CXX)
 
+# Resolve the ROCm root (and put its libs on LD_LIBRARY_PATH for HIP try_run
+# probes). Defined in CuCIMUtils; included early here as it is needed before
+# find_package(HIP) below.
+include(CuCIMUtils)
+cucim_resolve_rocm_path(ROCM_PATH)
+
 # Set CMAKE_PREFIX_PATH for ROCm/HIP if not already set
 if(NOT DEFINED CMAKE_PREFIX_PATH)
-    if(DEFINED ENV{ROCM_PATH})
-        set(CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")
-    elseif(EXISTS "/opt/rocm")
-        set(CMAKE_PREFIX_PATH "/opt/rocm")
-    endif()
+    set(CMAKE_PREFIX_PATH "${ROCM_PATH}")
 endif()
 
 find_package(HIP REQUIRED)
@@ -74,16 +76,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
 # Include CUDA headers explicitly for VSCode intelli-sense
 #include_directories(AFTER SYSTEM ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-include_directories(AFTER SYSTEM /opt/rocm/include)
+include_directories(AFTER SYSTEM ${ROCM_PATH}/include)
 
 # Disable visibility to not expose unnecessary symbols
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN NO)
 
-# Set RPATH
+# Set RPATH so the installed/relocated libraries resolve their ROCm dependencies
+# (libamdhip64, librocjpeg, ...) across install layouts:
+#   $ORIGIN                         co-located hipCIM libraries
+#   $ORIGIN/../../_rocm_sdk_*/lib   sibling ROCm pip wheels (relocatable venv)
+#   ${ROCM_PATH}/lib                build-time ROCm root (tarball / same venv)
+#   /opt/rocm/lib                   classic system install
 if (NOT APPLE)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN;/opt/rocm/lib")
-    set(CMAKE_BUILD_RPATH "$ORIGIN;/opt/rocm/lib")
+    set(HIPCIM_RPATH "$ORIGIN;$ORIGIN/../../_rocm_sdk_core/lib;$ORIGIN/../../_rocm_sdk_libraries/lib;$ORIGIN/../../_rocm_sdk_devel/lib;${ROCM_PATH}/lib;/opt/rocm/lib")
+    set(CMAKE_INSTALL_RPATH "${HIPCIM_RPATH}")
+    set(CMAKE_BUILD_RPATH "${HIPCIM_RPATH}")
 endif()
 
 # Set Installation setup

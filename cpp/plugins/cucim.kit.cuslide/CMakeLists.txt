@@ -17,8 +17,10 @@ file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/../../../HIPCIM_VERSION VERSION)
 # strip alpha version info
 string(REGEX REPLACE "a.*$" "" VERSION ${VERSION})
 
-# Append local cmake module path
+# Append local cmake module path (for SuperBuildUtils.cmake)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/modules")
+# Include central CuCIM cmake modules (for CuCIMUtils.cmake)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/../../../cpp/cmake/modules")
 
 project(hipslide VERSION ${VERSION} DESCRIPTION "hipslide" LANGUAGES C CXX)
 set(CUCIM_PLUGIN_NAME "hipcim.kit.hipslide")
@@ -77,10 +79,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
 
-# Set RPATH
+# Resolve the ROCm root (and put its libs on LD_LIBRARY_PATH for HIP try_run
+# probes). cucim_resolve_rocm_path is defined in CuCIMUtils (included above).
+cucim_resolve_rocm_path(ROCM_PATH)
+
+# Set RPATH so libraries resolve their ROCm dependencies across install layouts
+# (pip/venv wheels via $ORIGIN, build-time ROCm root, and system /opt/rocm).
 if (NOT APPLE)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN;/opt/rocm/lib")
-    set(CMAKE_BUILD_RPATH "$ORIGIN;/opt/rocm/lib")
+    set(HIPCIM_RPATH "$ORIGIN;$ORIGIN/../../_rocm_sdk_core/lib;$ORIGIN/../../_rocm_sdk_libraries/lib;$ORIGIN/../../_rocm_sdk_devel/lib;${ROCM_PATH}/lib;/opt/rocm/lib")
+    set(CMAKE_INSTALL_RPATH "${HIPCIM_RPATH}")
+    set(CMAKE_BUILD_RPATH "${HIPCIM_RPATH}")
 endif()
 message(CMAKE_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
 
@@ -138,8 +146,8 @@ find_package(hipcim CONFIG REQUIRED
           $ENV{PREFIX}/include/cmake/cucim # In case conda build is used
     )
 
-list(APPEND CMAKE_PREFIX_PATH /opt/rocm/share/rocjpeg/cmake)
-list(APPEND CMAKE_MODULE_PATH /opt/rocm/share/rocjpeg/cmake)
+list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH}/share/rocjpeg/cmake)
+list(APPEND CMAKE_MODULE_PATH ${ROCM_PATH}/share/rocjpeg/cmake)
 
 
 find_package(rocJPEG)

@@ -22,6 +22,31 @@ import json
 import sys
 
 
+def _recompute_totals(orig_totals, files):
+    """Re-aggregate an llvm-cov 'totals' block over the retained files so a
+    consumer reading 'totals' sees diff-scoped coverage, not whole-repo. Uses
+    the original totals as the metric/sub-key template; 'percent' is re-derived
+    as 100*covered/count (0 when count is 0, matching llvm-cov).
+    """
+    new_totals = {}
+    for metric, orig in orig_totals.items():
+        if not isinstance(orig, dict):
+            new_totals[metric] = orig
+            continue
+        agg = {key: 0 for key in orig if key != "percent"}
+        for file_entry in files:
+            summary = file_entry.get("summary", {}).get(metric, {})
+            for key in agg:
+                value = summary.get(key, 0)
+                if isinstance(value, (int, float)):
+                    agg[key] += value
+        if "percent" in orig:
+            count = agg.get("count", 0)
+            agg["percent"] = (100.0 * agg.get("covered", 0) / count) if count else 0.0
+        new_totals[metric] = agg
+    return new_totals
+
+
 def main():
     if len(sys.argv) != 4:
         print(
@@ -58,6 +83,10 @@ def main():
             fn for fn in entry.get("functions", [])
             if fn.get("filenames") and any(f in retained for f in fn["filenames"])
         ]
+        # Re-aggregate totals over the retained files so 'totals' reflects the
+        # diff-scoped set rather than the whole codebase.
+        if "totals" in entry:
+            entry["totals"] = _recompute_totals(entry["totals"], entry["files"])
 
     total_after = sum(len(entry["files"]) for entry in data["data"])
     print(

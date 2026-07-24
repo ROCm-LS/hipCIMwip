@@ -23,6 +23,30 @@ init_globals() {
             export GCC_TOOLCHAIN_ROOT=$(dirname "$(dirname "${_gcc_path}")")
         fi
     fi
+
+    # Resolve the ROCm root dynamically so the hardcoded /opt/rocm is only a last
+    # resort. Order: ROCM_PATH > ROCM_HOME > `rocm-sdk path --root` > `hipcc`
+    # location > /opt/rocm. Covers pip/venv (TheRock), tarball and system installs.
+    if [ -z "${ROCM_PATH:-}" ]; then
+        if [ -n "${ROCM_HOME:-}" ]; then
+            ROCM_PATH="${ROCM_HOME}"
+        elif command -v rocm-sdk >/dev/null 2>&1; then
+            ROCM_PATH="$(rocm-sdk path --root 2>/dev/null || true)"
+        fi
+    fi
+    if [ -z "${ROCM_PATH:-}" ] && command -v hipcc >/dev/null 2>&1; then
+        ROCM_PATH="$(dirname "$(dirname "$(command -v hipcc)")")"
+    fi
+    [ -z "${ROCM_PATH:-}" ] && ROCM_PATH="/opt/rocm"
+    export ROCM_PATH
+
+    # Put the ROCm runtime libs on the loader search path. hipcc links every
+    # binary (even pure-C++ ones with no HIP code) against libamdhip64.so, so
+    # CMake `try_run`/test probes fail at runtime with "libamdhip64.so.N:
+    # cannot open shared object file" when ${ROCM_PATH}/lib is not on the
+    # loader path (e.g. googlebenchmark's regex backend detection). Prepend it
+    # while preserving any existing LD_LIBRARY_PATH.
+    export LD_LIBRARY_PATH="${ROCM_PATH}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 }
 
 ################################################################################
@@ -273,8 +297,8 @@ build_local_libhipcim_() {
 
     pushd ${source_folder} > /dev/null
 
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # If coverage is enabled, ensure both C and C++ use hipcc
     local c_compiler_flag=""
@@ -299,8 +323,10 @@ build_local_libhipcim_() {
         ${c_compiler_flag} \
         ${gcc_toolchain_flag} \
         $(fetchcontent_offline_flag_ ${build_folder}) \
+        $(fetchcontent_base_flag_ ${source_folder} ${build_type}) \
         -DENABLE_CODE_COVERAGE=${enable_coverage} \
-        -DGPU_TARGETS="${AMDGPU_TARGETS}"
+        -DGPU_TARGETS="${AMDGPU_TARGETS}" \
+        && mark_fetchcontent_complete_ ${build_folder}
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim -- -j $(nproc)
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target install -- -j $(nproc)
 
@@ -337,8 +363,8 @@ build_local_hipslide_() {
     local CMAKE_CMD=${CMAKE_CMD:-cmake}
 
     pushd ${source_folder} > /dev/null
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
@@ -354,8 +380,10 @@ build_local_hipslide_() {
         -DCMAKE_CXX_COMPILER=hipcc \
         "${extra_cmake_args[@]}" \
         $(fetchcontent_offline_flag_ ${build_folder}) \
+        $(fetchcontent_base_flag_ ${source_folder} ${build_type}) \
         -DGPU_TARGETS="${AMDGPU_TARGETS}" \
-        -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
+        -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install \
+        && mark_fetchcontent_complete_ ${build_folder}
 
     if [ "${enable_coverage}" = "ON" ]; then
         # Build all plugin targets (lib + tests + benchmarks) so the test
@@ -382,8 +410,8 @@ build_local_hipmed_() {
 
     pushd ${source_folder} > /dev/null
 
-    export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
-    export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
+    export CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake
+    export CMAKE_MODULE_PATH=${ROCM_PATH}/lib/cmake
 
     # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
@@ -399,7 +427,10 @@ build_local_hipmed_() {
         -DCMAKE_CXX_COMPILER=hipcc \
         "${extra_cmake_args[@]}" \
         $(fetchcontent_offline_flag_ ${build_folder}) \
-        -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
+        $(fetchcontent_base_flag_ ${source_folder} ${build_type}) \
+        -DGPU_TARGETS="${AMDGPU_TARGETS}" \
+        -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install \
+        && mark_fetchcontent_complete_ ${build_folder}
 
     if [ "${enable_coverage}" = "ON" ]; then
         # Build all plugin targets (lib + tests + benchmarks) so the test
@@ -464,24 +495,63 @@ clean_build_keep_deps_() {
     done
 }
 
+fetchcontent_cache_key_() {
+    # Cache subdir for a build folder <src>/build-<type> (matches fetchcontent_base_flag_).
+    local sf bt
+    sf=$(dirname "$1")
+    bt=$(basename "$1"); bt=${bt#build-}
+    echo "${FETCHCONTENT_BASE_DIR}/$(basename "${sf}")-${bt}"
+}
+
+fetchcontent_deps_hash_() {
+    # Hash of the dep declaration files so a dep add/bump invalidates the cache.
+    find "$(dirname "$1")" -name 'build-*' -prune -o -name _deps -prune -o \
+        -path '*/cmake/deps/*.cmake' -print0 2>/dev/null \
+        | sort -z | xargs -0 cat 2>/dev/null | sha1sum | cut -d' ' -f1
+}
+
 fetchcontent_offline_flag_() {
-    # Echo the FetchContent offline flag ONLY when reconfiguring a build dir
-    # whose CMake cache was removed but whose `_deps/` was preserved (i.e. after
-    # a `clean_keep_deps`). Without it FetchContent would re-clone every
-    # dependency; with it, the preserved sources are reused. First builds and
-    # incremental builds are unaffected (a first build has no _deps; an
-    # incremental build keeps its cache, which already skips re-fetching). Use a
-    # full `clean` to force a fresh fetch.
-    if [ -d "$1/_deps" ] && [ ! -f "$1/CMakeCache.txt" ]; then
+    # Echo the FetchContent offline flag on a fresh configure (no CMakeCache) that
+    # can reuse already-fetched sources instead of re-cloning: a preserved local
+    # `_deps/` (clean_keep_deps) or a completed, dep-unchanged cache volume
+    # (fetchcontent_base_flag_). A full `clean` / cache clear forces a fresh fetch.
+    if [ -f "$1/CMakeCache.txt" ]; then return 0; fi
+    if [ -d "$1/_deps" ]; then
         echo "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+        return 0
     fi
+    if [ -n "${FETCHCONTENT_BASE_DIR:-}" ]; then
+        local marker
+        marker="$(fetchcontent_cache_key_ "$1")/.complete"
+        if [ -f "${marker}" ] && [ "$(cat "${marker}" 2>/dev/null)" = "$(fetchcontent_deps_hash_ "$1")" ]; then
+            echo "-DFETCHCONTENT_FULLY_DISCONNECTED=ON"
+        fi
+    fi
+}
+
+fetchcontent_base_flag_() {
+    # Relocate FetchContent's 3rd-party sources to $FETCHCONTENT_BASE_DIR (an
+    # optional cache volume), keyed per build dir so they survive clean rebuilds.
+    # Unset => CMake default (${build}/_deps); unchanged behaviour.
+    [ -n "${FETCHCONTENT_BASE_DIR:-}" ] || return 0
+    echo "-DFETCHCONTENT_BASE_DIR=${FETCHCONTENT_BASE_DIR}/$(basename "$1")-$2"
+}
+
+mark_fetchcontent_complete_() {
+    # Record (after a successful configure) that the keyed cache volume is fully
+    # populated for the current dep set, so the next fresh configure reuses it.
+    [ -n "${FETCHCONTENT_BASE_DIR:-}" ] || return 0
+    local key
+    key="$(fetchcontent_cache_key_ "$1")"
+    mkdir -p "${key}"
+    fetchcontent_deps_hash_ "$1" > "${key}/.complete"
 }
 
 build_local() {
     local subcommand="${1:-all}"
     local build_type="${2:-debug}"
     local build_type_str="Debug"
-    local prefix=${3:-}
+    local prefix=${3:-${ROCM_PATH:-/opt/rocm}}
 
     local major_version="$(cat ${TOP}/HIPCIM_VERSION | cut -d. -f1)" # major version number
 
@@ -627,6 +697,38 @@ Arguments:
   $2 - test_component [all|clara|skimage] (default: all)
 '
 }
+
+# Build (once) and activate an LD_PRELOAD interposer that lets host-only LLVM
+# coverage run on HIP code without aborting. AMD clang registers an offload
+# "profile shadow" variable (__llvm_profile_sections_<cuid>) with the HIP runtime
+# for every instrumented HIP TU; with host-only instrumentation it has no
+# device-side symbol, so the HIP runtime aborts at fat-binary teardown
+# ("Cannot create GlobalVar Obj for symbol: __llvm_profile_sections_*"). The
+# interposer drops only those registrations; host coverage data and genuine
+# device-variable registrations are unaffected. See scripts/hip_profile_shim.c.
+enable_hip_profile_shim_() {
+    local shim_src="${TOP}/scripts/hip_profile_shim.c"
+    local shim_so="${TMPDIR:-/tmp}/hipcim_profile_shim_$(id -u).so"
+    if [ ! -f "${shim_src}" ]; then
+        c_echo Y "[WARN] ${shim_src} missing; HIP profile shim disabled (coverage run may abort)"
+        return 1
+    fi
+    if [ ! -f "${shim_so}" ] || [ "${shim_src}" -nt "${shim_so}" ]; then
+        if ! gcc -O2 -fPIC -shared -o "${shim_so}" "${shim_src}" -ldl 2>/dev/null; then
+            c_echo Y "[WARN] failed to build HIP profile shim; coverage run may abort"
+            return 1
+        fi
+    fi
+    # LD_PRELOAD is whitespace- or colon-separated by the loader; use spaces so
+    # the shim path composes cleanly with any existing value (a lone entry set
+    # with spaces would be split on an appended ':').
+    case " ${LD_PRELOAD:-} " in
+        *" ${shim_so} "*) ;;  # already active
+        *) export LD_PRELOAD="${shim_so}${LD_PRELOAD:+ $LD_PRELOAD}" ;;
+    esac
+    c_echo G "HIP profile shim active (drops __llvm_profile_sections HIP registration)"
+}
+
 test_python() {
     local test_type="${1:-all}"
     local test_component="${2:-all}"
@@ -1274,7 +1376,7 @@ install_cupy() {
 
     echo "Setting up environment for CuPy build..."
     export CUPY_INSTALL_USE_HIP=1
-    export ROCM_HOME=/opt/rocm
+    export ROCM_HOME=${ROCM_PATH:-/opt/rocm}
     export HCC_AMDGPU_TARGET=${AMDGPU_TARGETS//;/,}
 
     echo "Building CuPy wheel..."
