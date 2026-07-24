@@ -143,7 +143,6 @@ python_files = [
     "*_test.py",
     "tests.py",
 ]
-#skipping test_j_invariant.py for now due to NVRTC/HIPRTC compilation errors and src/cucim/skimage tests due to cupy HIPRTC errors
 addopts = [
     "-ra",
     "--strict-markers",

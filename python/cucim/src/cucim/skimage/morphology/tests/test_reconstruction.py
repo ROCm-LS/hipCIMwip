@@ -351,13 +351,6 @@ def test_auto_falls_back_for_unsupported_gpu_offset():
 @pytest.mark.parametrize("method", ["dilation", "erosion"])
 def test_gpu_cval_dtype_extremes(dtype, method):
     dtype = cp.dtype(dtype)
-    if method == "erosion" and dtype == cp.int64:
-        pytest.skip(
-            "CuPy upstream bug: minimum_filter uses double as intermediate in "
-            "the separable 1D kernel path, which cannot represent int64 values "
-            "> 2^53. The double-to-int64 roundtrip is undefined behavior and "
-            "produces corrupted results on AMD GPUs."
-        )
     if dtype.kind in "iu":
         info = cp.iinfo(dtype)
         low = info.min
