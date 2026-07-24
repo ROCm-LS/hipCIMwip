@@ -122,10 +122,19 @@ if(ENABLE_CODE_COVERAGE)
     set(COVERAGE_C_FLAGS "")
 
     # Check C++ compiler
-    if(CMAKE_CXX_COMPILER MATCHES "hipcc" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        # LLVM/Clang coverage flags for C++
+    if(CMAKE_CXX_COMPILER MATCHES "hipcc")
+        # hipcc compiles every C++ translation unit for BOTH the host and the
+        # amdgcn device. LLVM profile instrumentation has no amdgcn runtime, so
+        # an unscoped -fprofile-instr-generate makes the device link fail with
+        # undefined __llvm_profile_* / __start___llvm_prf_* symbols. Scope the
+        # instrumentation to the host sub-compilation with -Xarch_host; -g stays
+        # global (debug info is fine on both host and device).
+        set(COVERAGE_CXX_FLAGS "-Xarch_host -fprofile-instr-generate -Xarch_host -fcoverage-mapping -g")
+        message(STATUS "Using LLVM coverage flags for C++ (hipcc, host-only instrumentation)")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # LLVM/Clang coverage flags for C++ (non-offloading clang)
         set(COVERAGE_CXX_FLAGS "-fprofile-instr-generate -fcoverage-mapping -g")
-        message(STATUS "Using LLVM coverage flags for C++ (hipcc/clang)")
+        message(STATUS "Using LLVM coverage flags for C++ (clang)")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
         # GCC coverage flags for C++
         set(COVERAGE_CXX_FLAGS "-fprofile-arcs -ftest-coverage -g")

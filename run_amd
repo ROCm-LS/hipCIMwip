@@ -306,10 +306,21 @@ build_local_libhipcim_() {
         c_compiler_flag="-DCMAKE_C_COMPILER=hipcc"
     fi
 
-    # Pass --gcc-toolchain to hipcc so it finds the correct libstdc++ headers
+    # Pass --gcc-toolchain to both the C++ (hipcc) and HIP-language compilers so
+    # they resolve the correct libstdc++ headers/libs. On manylinux the ROCm
+    # clang++ that CMake uses for enable_language(HIP) has no default GCC, so
+    # without --gcc-toolchain in CMAKE_HIP_FLAGS the HIP compiler check fails at
+    # link with: "ld.lld: error: unable to find library -lstdc++".
     local gcc_toolchain_flag=""
     if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
-        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+        gcc_toolchain_flag="-DCMAKE_CXX_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT} -DCMAKE_HIP_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+        # In coverage mode the C compiler is forced to hipcc (clang-based),
+        # which also needs --gcc-toolchain to find libstdc++/crt; otherwise the
+        # C-compiler ABI check fails with "ld.lld: unable to find library
+        # -lstdc++". Plain gcc (non-coverage) must NOT get this clang-only flag.
+        if [ "${enable_coverage}" = "ON" ]; then
+            gcc_toolchain_flag="${gcc_toolchain_flag} -DCMAKE_C_FLAGS=--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+        fi
     fi
 
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
@@ -346,7 +357,11 @@ coverage_cxx_flags_() {
         cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
     fi
     if [ "${enable_coverage}" = "ON" ]; then
-        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
+        # Instrument only the HOST sub-compilation: hipcc compiles each TU for
+        # host + amdgcn device, and there is no amdgcn LLVM profile runtime, so an
+        # unscoped -fprofile-instr-generate makes the device link fail (undefined
+        # __llvm_profile_* symbols). -Xarch_host scopes coverage to the host pass.
+        cxx_flags="${cxx_flags} -Xarch_host -fprofile-instr-generate -Xarch_host -fcoverage-mapping -g"
     fi
     echo "${cxx_flags}"
 }
@@ -757,6 +772,9 @@ test_python() {
     # the instrumented build (bytes match install/lib, so profiles merge with
     # the C++-test run).
     if [ "${HIPCIM_CPP_PROFILE:-OFF}" = "ON" ]; then
+        # The C++ extension pytest drives is host-instrumented HIP code; without
+        # this interposer the HIP runtime aborts at process teardown.
+        enable_hip_profile_shim_
         local _pyroot _clara _core _t _p
         _pyroot="$(ls -d ${TOP}/python/cucim/build/lib.*/ 2>/dev/null | head -1)"
         if [ -n "${_pyroot}" ] && [ -d "${_pyroot}cucim/clara" ]; then
@@ -773,8 +791,17 @@ test_python() {
             export LLVM_PROFILE_FILE="${TOP}/py_cov_%p_%9m.profraw"
             rm -f ${TOP}/py_cov_*.profraw
             c_echo G "C++ profiling ON for pytest (PYTHONPATH=${_pyroot}, LLVM_PROFILE_FILE set)"
+        elif ls ${TOP}/python/cucim/src/cucim/clara/_cucim*.so >/dev/null 2>&1; then
+            # No setuptools in-place build (e.g. PEP 660 editable install): cucim
+            # imports from python/cucim/src/cucim/clara, where coverage_full's
+            # `build_local hipcim` step already placed the freshly built
+            # INSTRUMENTED core + plugin libs next to _cucim.so. Just enable LLVM
+            # profiling so the C++ pytest drives emits py_cov_*.profraw.
+            export LLVM_PROFILE_FILE="${TOP}/py_cov_%p_%9m.profraw"
+            rm -f ${TOP}/py_cov_*.profraw
+            c_echo G "C++ profiling ON for pytest (in-place src/cucim/clara, LLVM_PROFILE_FILE set)"
         else
-            c_echo Y "HIPCIM_CPP_PROFILE=ON but no importable build under python/cucim/build/lib.*; C++ profiling skipped"
+            c_echo Y "HIPCIM_CPP_PROFILE=ON but no importable build under python/cucim/build/lib.* or src/cucim/clara; C++ profiling skipped"
         fi
     fi
 
@@ -790,10 +817,18 @@ test_python() {
     result=$?
 
     # Generate JSON from the collected coverage data, scoped to changed files
-    # if a difflist is available.
+    # if a difflist is available. Coverage is recorded against the location the
+    # package is imported from -- under python/cucim/build/lib.*/cucim/... when
+    # HIPCIM_CPP_PROFILE=ON drives the in-place build (to pick up the
+    # instrumented C++ libs), or site-packages/cucim/... for an installed wheel
+    # -- NOT the source tree. So scope by the package-relative path
+    # (*/cucim/<subpath>), which matches every layout; the source-tree path
+    # (*/python/cucim/src/cucim/<subpath>) matches none of them and yields
+    # "No data to report". coverage.py's '*' crosses '/', so the single leading
+    # */ absorbs any prefix (build/lib.*, site-packages, src, ...).
     DIFFLIST_PYTHON_FILE="${TOP}/difflist-python.txt"
     if [ -f "${DIFFLIST_PYTHON_FILE}" ] && [ -s "${DIFFLIST_PYTHON_FILE}" ]; then
-        INCLUDE_PATTERNS=$(cat "${DIFFLIST_PYTHON_FILE}" | sed 's|^|*/|' | paste -sd ',' -)
+        INCLUDE_PATTERNS=$(cat "${DIFFLIST_PYTHON_FILE}" | sed -E 's#^.*/src/cucim/#cucim/#; s#^#*/#' | paste -sd ',' -)
         c_echo G "Scoping Python coverage to diff files: ${INCLUDE_PATTERNS}"
         run_command coverage json --ignore-errors \
             --include="${INCLUDE_PATTERNS}" \
@@ -832,6 +867,9 @@ test_cpp() {
 	if [ "${ENABLE_COVERAGE}" = "ON" ]; then
 		export LLVM_PROFILE_FILE="${TOP}/code_cov_%p_%9m.profraw"
 		c_echo Y "Coverage profiling enabled - output to ${TOP}/*.profraw"
+		# Instrumented HIP binaries abort in the HIP runtime at teardown unless
+		# the profile-shadow-variable registration is dropped.
+		enable_hip_profile_shim_
 	fi
 
 	# Generate synthetic fixtures (TIFF stripes + NIfTI/DICOM volumes); idempotent
@@ -921,6 +959,13 @@ coverage_full() {
     # 1) Instrumented build (core libhipcim + cuslide/cumed plugins).
     build_cpp_coverage "${build_type}"
 
+    # 1b) Rebuild the Python bindings. build_cpp_coverage's clean removed the
+    #     in-place python/cucim/src/cucim/clara/*.so, so pytest could not import
+    #     cucim.clara._cucim. This rebuilds _cucim.so and copies the freshly
+    #     built INSTRUMENTED core + plugin libs next to it, so the C++ that
+    #     pytest drives is instrumented too (feeds py_cov_*.profraw).
+    build_local hipcim "${build_type}"
+
     # 2) Python unit suite: coverage.py (Python lines) + LLVM profiling of the
     #    C++ extension it drives (emits py_cov_*.profraw).
     export HIPCIM_CPP_PROFILE=ON
@@ -975,11 +1020,13 @@ test_cpp_coverage() {
     cd ${TOP}
 
     # Find LLVM tools — prefer the versioned LLVM 20 binaries installed by the
-    # official llvm.sh script. Fall back to whatever is on PATH only if the
-    # versioned binaries are absent (should not happen in normal CI builds).
+    # official llvm.sh script. Otherwise fall back to the ROCm SDK's own llvm
+    # binaries (${ROCM_PATH}/lib/llvm/bin), which match the LLVM version of the
+    # ROCm clang that instruments the C++ (required for the pip ROCm SDK, where
+    # there is no /opt/rocm), then to whatever else is on PATH.
     LLVM_PROFDATA="/usr/bin/llvm-profdata-20"
     if [ ! -f "${LLVM_PROFDATA}" ]; then
-        for dir in /opt/rocm/llvm/bin /opt/rocm/bin /usr/bin; do
+        for dir in ${ROCM_PATH}/lib/llvm/bin /opt/rocm/llvm/bin /opt/rocm/bin /usr/bin; do
             if [ -f "${dir}/llvm-profdata" ]; then
                 LLVM_PROFDATA="${dir}/llvm-profdata"
                 break
@@ -989,7 +1036,7 @@ test_cpp_coverage() {
 
     LLVM_COV="/usr/bin/llvm-cov-20"
     if [ ! -f "${LLVM_COV}" ]; then
-        for dir in /opt/rocm/llvm/bin /opt/rocm/bin /usr/bin; do
+        for dir in ${ROCM_PATH}/lib/llvm/bin /opt/rocm/llvm/bin /opt/rocm/bin /usr/bin; do
             if [ -f "${dir}/llvm-cov" ]; then
                 LLVM_COV="${dir}/llvm-cov"
                 break
