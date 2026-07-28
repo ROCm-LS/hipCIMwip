@@ -300,7 +300,7 @@ build_local_libhipcim_() {
         ${gcc_toolchain_flag} \
         $(fetchcontent_offline_flag_ ${build_folder}) \
         -DENABLE_CODE_COVERAGE=${enable_coverage} \
-        -DGPU_TARGETS=${AMDGPU_TARGETS}
+        -DGPU_TARGETS="${AMDGPU_TARGETS}"
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target hipcim -- -j $(nproc)
         ${CMAKE_CMD} --build ${build_folder} --config ${build_type_str} --target install -- -j $(nproc)
 
@@ -354,7 +354,7 @@ build_local_hipslide_() {
         -DCMAKE_CXX_COMPILER=hipcc \
         "${extra_cmake_args[@]}" \
         $(fetchcontent_offline_flag_ ${build_folder}) \
-        -DGPU_TARGETS=${AMDGPU_TARGETS} \
+        -DGPU_TARGETS="${AMDGPU_TARGETS}" \
         -DCMAKE_INSTALL_PREFIX=${cucim_source_folder}/install
 
     if [ "${enable_coverage}" = "ON" ]; then
