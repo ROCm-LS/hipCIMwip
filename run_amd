@@ -1299,8 +1299,18 @@ main() {
     local ret=0
     parse_args "$@"
 
+    # --diff only scopes the coverage commands. Generating difflists for any
+    # other command is pointless and harmful: it can abort on a missing ref or
+    # leave stray difflist*.txt files that silently scope a later coverage run.
     if [ -n "${DIFF_REF:-}" ]; then
-        generate_difflists_ "${DIFF_REF}"
+        case "$CMD" in
+            test_python|test_cpp_coverage|coverage_full)
+                generate_difflists_ "${DIFF_REF}"
+                ;;
+            *)
+                c_echo_err Y "--diff ignored for '${CMD}': only applies to test_python, test_cpp_coverage, coverage_full."
+                ;;
+        esac
     fi
 
     case "$CMD" in
