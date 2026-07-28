@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <sys/stat.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,13 +45,36 @@ bool region_has_content(cucim::CuImage& region)
     }
     return nonzero && varied;
 }
+
+// True if `path` names an existing filesystem entry.
+bool file_exists(const std::string& path)
+{
+    struct stat buffer;
+    return stat(path.c_str(), &buffer) == 0;
+}
+
+// Resolve a generated medical fixture, or SKIP the test when it is absent.
+// gen_medical.py no-ops (and gen_images.sh still exits 0) when nibabel/pydicom
+// are unavailable, so these fixtures may legitimately not exist. Skipping turns
+// that missing optional dependency into a clear, self-explanatory skip instead
+// of a confusing CuImage decode failure later in the case.
+std::string medical_fixture_or_skip(const std::string& rel_path)
+{
+    const std::string path = g_config.get_input_path(rel_path);
+    if (!file_exists(path))
+    {
+        SKIP("Medical fixture '" + rel_path + "' not found; run test_data/gen_medical.py "
+             "(needs nibabel/pydicom). Skipping.");
+    }
+    return path;
+}
 } // namespace
 
 SCENARIO("cumed parses NIfTI volumes", "[test_medical.cpp]")
 {
     GIVEN("A 3D uint8 NIfTI volume")
     {
-        const std::string path = g_config.get_input_path("generated/medical/vol_uint8.nii");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_uint8.nii");
         cucim::CuImage image(path);
 
         THEN("Header geometry and dtype are parsed into metadata")
@@ -102,7 +127,7 @@ SCENARIO("cumed parses NIfTI volumes", "[test_medical.cpp]")
 
     GIVEN("A 3D int16 NIfTI volume with intensity scaling")
     {
-        const std::string path = g_config.get_input_path("generated/medical/vol_int16.nii");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_int16.nii");
         cucim::CuImage image(path);
 
         THEN("The signed 16-bit datatype is mapped and the volume is readable")
@@ -123,7 +148,7 @@ SCENARIO("cumed parses uncompressed DICOM images", "[test_medical.cpp]")
 {
     GIVEN("A single-frame MONOCHROME2 uint16 DICOM")
     {
-        const std::string path = g_config.get_input_path("generated/medical/ct_mono16.dcm");
+        const std::string path = medical_fixture_or_skip("generated/medical/ct_mono16.dcm");
         cucim::CuImage image(path);
 
         THEN("Rows/Columns/BitsAllocated map onto the image metadata")
@@ -158,7 +183,7 @@ SCENARIO("cumed parses uncompressed DICOM images", "[test_medical.cpp]")
 
     GIVEN("A single-frame RGB uint8 DICOM")
     {
-        const std::string path = g_config.get_input_path("generated/medical/rgb_u8.dcm");
+        const std::string path = medical_fixture_or_skip("generated/medical/rgb_u8.dcm");
         cucim::CuImage image(path);
 
         THEN("Three interleaved samples per pixel are reported and read")
@@ -187,7 +212,7 @@ SCENARIO("cumed handles NIfTI and DICOM encoding variants", "[test_medical.cpp]"
     GIVEN("A big-endian NIfTI file")
     {
         // Forces the header byte-swap path in nifti.h (sizeof_hdr != 348 on read).
-        const std::string path = g_config.get_input_path("generated/medical/vol_be.nii");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_be.nii");
         cucim::CuImage image(path);
         THEN("The byte-swapped header parses and the volume reads")
         {
@@ -201,7 +226,7 @@ SCENARIO("cumed handles NIfTI and DICOM encoding variants", "[test_medical.cpp]"
     GIVEN("A gzip-compressed NIfTI file (.nii.gz)")
     {
         // Forces the libdeflate gunzip path in nifti.h.
-        const std::string path = g_config.get_input_path("generated/medical/vol_gz.nii.gz");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_gz.nii.gz");
         cucim::CuImage image(path);
         THEN("The decompressed volume parses and reads")
         {
@@ -214,7 +239,7 @@ SCENARIO("cumed handles NIfTI and DICOM encoding variants", "[test_medical.cpp]"
     GIVEN("An Implicit VR Little Endian DICOM")
     {
         // Forces the implicit-VR mini-dictionary path in dicom.h implicit_vr().
-        const std::string path = g_config.get_input_path("generated/medical/ct_implicit.dcm");
+        const std::string path = medical_fixture_or_skip("generated/medical/ct_implicit.dcm");
         cucim::CuImage image(path);
         THEN("Tags are resolved via the implicit-VR dictionary and pixels read")
         {
@@ -231,7 +256,7 @@ SCENARIO("cumed handles NIfTI and DICOM encoding variants", "[test_medical.cpp]"
     GIVEN("A signed 16-bit MONOCHROME1 DICOM")
     {
         // PixelRepresentation=1 exercises the signed-integer dtype mapping.
-        const std::string path = g_config.get_input_path("generated/medical/ct_signed.dcm");
+        const std::string path = medical_fixture_or_skip("generated/medical/ct_signed.dcm");
         cucim::CuImage image(path);
         THEN("The signed datatype is reported and pixels read")
         {
@@ -265,7 +290,7 @@ SCENARIO("cumed maps NIfTI datatypes and time-series dimensions", "[test_medical
         GIVEN(std::string("A NIfTI volume: ") + c.file)
         {
             const std::string path =
-                g_config.get_input_path(std::string("generated/medical/") + c.file);
+                medical_fixture_or_skip(std::string("generated/medical/") + c.file);
             cucim::CuImage image(path);
             THEN("nifti_datatype_to_dl maps it and the volume reads")
             {
@@ -281,7 +306,7 @@ SCENARIO("cumed maps NIfTI datatypes and time-series dimensions", "[test_medical
     GIVEN("A 4D NIfTI time-series")
     {
         // A non-unit time dimension takes the ndim==5 (TZYXC) branch in cumed.
-        const std::string path = g_config.get_input_path("generated/medical/vol_4d.nii");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_4d.nii");
         cucim::CuImage image(path);
         THEN("The temporal dimension is exposed")
         {
@@ -296,7 +321,7 @@ SCENARIO("cumed maps NIfTI datatypes and time-series dimensions", "[test_medical
     GIVEN("A qform-only NIfTI (sform disabled)")
     {
         // sform_code==0, qform_code>0 -> direction rebuilt from the quaternion.
-        const std::string path = g_config.get_input_path("generated/medical/vol_qform.nii");
+        const std::string path = medical_fixture_or_skip("generated/medical/vol_qform.nii");
         cucim::CuImage image(path);
         THEN("The quaternion-derived orientation is exposed")
         {
