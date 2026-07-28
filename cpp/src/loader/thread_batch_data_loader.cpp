@@ -282,9 +282,45 @@ uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster)
     if (raster != nullptr && out_device_.type() == cucim::io::DeviceType::kCPU &&
         output_device_.type() == cucim::io::DeviceType::kCUDA)
     {
+        // move_raster_from_host() allocates via cudaMalloc on the *current* CUDA
+        // device, so make the requested output device current first and restore
+        // the previous device afterward. Without this, a non-current output
+        // device (e.g. cuda:1) would receive a pointer allocated on the wrong
+        // device. A negative index means "unspecified", so keep the current one.
+        const int dst_index = static_cast<int>(output_device_.index());
+        int prev_index = -1;
+        bool device_switched = false;
+        if (dst_index >= 0)
+        {
+            cudaError_t cuda_status = cudaGetDevice(&prev_index);
+            if (cuda_status == cudaSuccess && dst_index != prev_index)
+            {
+                cuda_status = cudaSetDevice(dst_index);
+                if (cuda_status != cudaSuccess)
+                {
+                    fprintf(stderr, "cudaSetDevice(%d) failed: %s\n", dst_index,
+                            cudaGetErrorString(cuda_status));
+                }
+                else
+                {
+                    device_switched = true;
+                }
+            }
+        }
+
         void* staged = raster;
         cucim::memory::move_raster_from_host(&staged, buffer_size_, output_device_);
         raster = static_cast<uint8_t*>(staged);
+
+        if (device_switched)
+        {
+            // Best-effort restore; check the result so hipSetDevice's [[nodiscard]]
+            // does not trip -Werror.
+            if (cudaSetDevice(prev_index) != cudaSuccess)
+            {
+                fprintf(stderr, "cudaSetDevice(%d) restore failed\n", prev_index);
+            }
+        }
     }
     return raster;
 }
