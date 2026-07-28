@@ -112,7 +112,9 @@ def _write_dicom(path, rows, cols, samples=1, implicit_vr=False, geometry=False)
         ]
     elements.append(
         _dicom_element(
-            0x7FE0, 0x0010, b"OW", bytes(range(rows * cols * samples)), imp
+            # 8-bit uncompressed Pixel Data uses VR=OB under Explicit VR LE (OW
+            # is for >8-bit); matches the encapsulated OB helper below.
+            0x7FE0, 0x0010, b"OB", bytes(range(rows * cols * samples)), imp
         )
     )
     path.write_bytes(

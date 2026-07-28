@@ -73,8 +73,13 @@ if(NOT COMMAND cucim_resolve_rocm_path)
                 execute_process(
                     COMMAND "${ROCM_SDK_EXECUTABLE}" path --root
                     OUTPUT_VARIABLE _rocm_sdk_root
+                    RESULT_VARIABLE _rocm_sdk_rc
                     OUTPUT_STRIP_TRAILING_WHITESPACE
                     ERROR_QUIET)
+                if(NOT _rocm_sdk_rc EQUAL 0)
+                    message(DEBUG "hipCIM: rocm-sdk path --root exited with ${_rocm_sdk_rc}; skipping")
+                    set(_rocm_sdk_root "")
+                endif()
             endif()
             if(_rocm_sdk_root AND IS_DIRECTORY "${_rocm_sdk_root}")
                 set(_rocm_root "${_rocm_sdk_root}")
@@ -91,7 +96,8 @@ if(NOT COMMAND cucim_resolve_rocm_path)
 
         # Prepend ${_rocm_root}/lib to LD_LIBRARY_PATH only if not already
         # present, so repeated calls (top-level project + subprojects) do not
-        # accumulate duplicate entries.
+        # accumulate duplicate entries.  Note: this mutation is permanent for
+        # the CMake process lifetime (needed by hipcc-linked try_run probes).
         set(_rocm_lib "${_rocm_root}/lib")
         if("$ENV{LD_LIBRARY_PATH}" STREQUAL "")
             set(ENV{LD_LIBRARY_PATH} "${_rocm_lib}")

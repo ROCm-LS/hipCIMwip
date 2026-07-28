@@ -274,7 +274,7 @@ uint32_t ThreadBatchDataLoader::wait_batch()
 }
 
 
-uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster)
+uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster, size_t stage_size)
 {
     // When tiles were decoded on the host but a CUDA output was requested, copy
     // the raster onto the output device so callers always receive a buffer that
@@ -313,7 +313,7 @@ uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster)
         }
 
         void* staged = raster;
-        cucim::memory::move_raster_from_host(&staged, buffer_size_, output_device_);
+        cucim::memory::move_raster_from_host(&staged, stage_size, output_device_);
         raster = static_cast<uint8_t*>(staged);
 
         if (device_switched)
@@ -345,7 +345,9 @@ uint8_t* ThreadBatchDataLoader::next_data()
         // by setting it to nullptr so that it will not be freed by ~ThreadBatchDataLoader (destructor).
         uint8_t* batch_raster_ptr = raster_data_[0];
         raster_data_[0] = nullptr;
-        batch_raster_ptr = stage_to_output_device_(batch_raster_ptr);
+        // Single full raster here (location_len == 1 && batch_size == 1), so the
+        // whole buffer is valid.
+        batch_raster_ptr = stage_to_output_device_(batch_raster_ptr, buffer_size_);
         current_data_ = batch_raster_ptr;
         return batch_raster_ptr;
     }
@@ -396,7 +398,12 @@ uint8_t* ThreadBatchDataLoader::next_data()
 
     buffer_item_head_index_ = (buffer_item_head_index_ + 1) % buffer_item_len_;
 
-    batch_raster_ptr = stage_to_output_device_(batch_raster_ptr);
+    // Stage only the valid bytes for this batch. The final batch can be partial
+    // (fewer than batch_size_ items), so staging the full buffer_size_ would copy
+    // uninitialized trailing bytes and over-allocate on the device.
+    const uint64_t batch_item_count =
+        std::min(location_len_ - (processed_batch_count_ * batch_size_), static_cast<uint64_t>(batch_size_));
+    batch_raster_ptr = stage_to_output_device_(batch_raster_ptr, one_rester_size_ * batch_item_count);
     current_data_ = batch_raster_ptr;
     current_data_batch_size_ =
         std::min(location_len_ - (processed_batch_count_ * batch_size_), static_cast<uint64_t>(batch_size_));

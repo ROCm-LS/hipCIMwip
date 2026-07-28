@@ -39,6 +39,8 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Matches the HIP runtime ABI for __hipRegisterVar (all args are pointers/ints,
@@ -68,9 +70,13 @@ void __hipRegisterVar(void **modules, char *var, const char *host_name,
     if (!real_register_var) {
         real_register_var =
             (hip_register_var_fn)dlsym(RTLD_NEXT, "__hipRegisterVar");
+        if (!real_register_var) {
+            fprintf(stderr,
+                    "hip_profile_shim: dlsym(RTLD_NEXT, \"__hipRegisterVar\") "
+                    "failed: %s\n", dlerror());
+            abort();
+        }
     }
-    if (real_register_var) {
-        real_register_var(modules, var, host_name, device_name, ext, size,
-                          constant, global);
-    }
+    real_register_var(modules, var, host_name, device_name, ext, size,
+                      constant, global);
 }

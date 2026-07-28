@@ -40,7 +40,12 @@ def _gcc_toolchain_root():
 
 
 def _patch_cupy_gcc_toolchain():
-    """Inject ``--gcc-toolchain`` into CuPy's runtime kernel compiler on HIP."""
+    """Inject ``--gcc-toolchain`` into CuPy's runtime kernel compiler on HIP.
+
+    Relies on the internal ``cupy.cuda.compiler._compile_module_with_cache``
+    symbol, validated against amd-cupy 13.5.1 and 14.1.1. If CuPy restructures
+    this API the patch silently no-ops (the AttributeError is absorbed below).
+    """
     try:
         import cupy
         from cupy.cuda import compiler

@@ -77,8 +77,10 @@ public:
 
 private:
     // Stage a host-decoded raster onto output_device_ when it differs from the
-    // decode device (out_device_). Returns the buffer to expose.
-    uint8_t* stage_to_output_device_(uint8_t* raster);
+    // decode device (out_device_). stage_size is the number of valid bytes to
+    // copy and allocate on the device (may be < buffer_size_ for a partial final
+    // batch). Returns the buffer to expose.
+    uint8_t* stage_to_output_device_(uint8_t* raster, size_t stage_size);
 
     bool stopped_ = false;
     LoadFunc load_func_;
