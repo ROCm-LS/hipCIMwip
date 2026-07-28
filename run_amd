@@ -957,7 +957,8 @@ test_cpp_coverage() {
         ${OBJECTS} 2>>$RUN_LOG \
         || c_echo Y "⚠ llvm-cov show failed (source files likely absent); continuing"
 
-    # Generate JSON report (full coverage; difflist.txt available for downstream filtering)
+    # Generate JSON report (full coverage; difflist.txt available for downstream filtering).
+    # rocjpeg/cufile are GPU/GDS-only (unreachable here); generate_difflists_ excludes them too.
     echo "Generating JSON coverage report (export)"
     ${LLVM_COV} export                                    \
         --instr-profile=${MERGED_PROFDATA}                \
@@ -1157,8 +1158,11 @@ generate_difflists_() {
         exit 1
     fi
     c_echo G "Scoping coverage to diff: ${base_ref}...HEAD"
+    # Also drop rocJPEG/cuFile (GPU/GDS-only, unreachable here) to match the
+    # llvm-cov --ignore-filename-regex list, so the delta % isn't inflated.
     git -C "${TOP}" diff --name-only --diff-filter=AM "${base_ref}...HEAD" \
-        | grep -E '\.(cpp|h|cu|cuh)$' > "${TOP}/difflist.txt" || true
+        | grep -E '\.(cpp|h|cu|cuh)$' \
+        | grep -Eiv 'rocjpeg|cufile' > "${TOP}/difflist.txt" || true
     git -C "${TOP}" diff --name-only --diff-filter=AM "${base_ref}...HEAD" \
         | grep 'python/cucim/src' | grep -v '/tests/' | grep -v '/test_' \
         | grep -E '\.py$' > "${TOP}/difflist-python.txt" || true
