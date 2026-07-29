@@ -9,11 +9,13 @@ build-backend = "setuptools.build_meta"
 requires = [
     "setuptools>=80.9.0",
     "wheel",
-    "setuptools_scm[toml]>=7.0"]
+    "setuptools_scm[toml]>=7.0",
+    # tomli lets setup.py parse this file on Python < 3.11 (tomllib is 3.11+).
+    "tomli>=1.1.0; python_version < '3.11'"]
 
 [project]
 name = "amd-hipcim"
-dynamic = ["version" ]
+dynamic = ["version", "optional-dependencies"]
 description = "hipCIM - an extensible toolkit designed to provide GPU accelerated I/O, computer vision & image processing primitives for N-Dimensional images with a focus on biomedical imaging."
 # TODO: tried also adding CHANGELOG.md as in setup.py's long_description, but ruff complained about it
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -30,7 +32,6 @@ dependencies = [
     "scikit-image>=0.23.2,<0.27.0",
     "scipy>=1.11.2,<1.17",
     "amd-cupy>=13.5.1",
-    "rocm[libraries]",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -54,7 +55,10 @@ Documentation = "https://rocm.docs.amd.com/projects/hipCIM/en/latest/"
 Source = "https://github.com/ROCm-LS/hipCIM"
 Tracker = "https://github.com/ROCm-LS/hipCIM/issues"
 
-[project.optional-dependencies]
+# The `rocm` extra pin must track the ROCm series the wheel is built against, so
+# optional-dependencies is dynamic (see [project].dynamic): setup.py loads these
+# static extras and adds only the computed `rocm` pin.
+[tool.hipcim.optional-dependencies]
 test = [
     "imagecodecs>=2021.6.8; platform_machine=='x86_64'",
     "matplotlib>=3.7",
