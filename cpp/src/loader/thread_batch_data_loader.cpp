@@ -8,6 +8,7 @@
 #include "cucim/loader/thread_batch_data_loader.h"
 
 #include <cassert>
+#include <stdexcept>
 
 #include <fmt/format.h>
 
@@ -298,13 +299,16 @@ uint8_t* ThreadBatchDataLoader::stage_to_output_device_(uint8_t* raster)
                 cuda_status = cudaSetDevice(dst_index);
                 if (cuda_status != cudaSuccess)
                 {
-                    fprintf(stderr, "cudaSetDevice(%d) failed: %s\n", dst_index,
-                            cudaGetErrorString(cuda_status));
+                    // Fail fast: if the requested device cannot be made current,
+                    // move_raster_from_host() below would allocate on the wrong
+                    // (current) device and return a pointer that does not live on
+                    // output_device_, reintroducing the cross-device bug this
+                    // staging is meant to prevent.
+                    throw std::runtime_error(fmt::format(
+                        "stage_to_output_device_: cudaSetDevice({}) failed: {}", dst_index,
+                        cudaGetErrorString(cuda_status)));
                 }
-                else
-                {
-                    device_switched = true;
-                }
+                device_switched = true;
             }
         }
 
