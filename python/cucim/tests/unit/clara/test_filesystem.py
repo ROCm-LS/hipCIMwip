@@ -30,7 +30,10 @@ def test_pread_host_buffer(tmp_path):
         assert fs.pread(fd, buf, 256, 0) == 256
         assert np.array_equal(buf, np.arange(256, dtype=np.uint8))
 
-        # Read from a non-zero file offset into a non-zero buffer offset.
+        # Read from a non-zero file offset into a non-zero buffer offset. The
+        # 5th arg is hipCIM's cuFile buffer-offset extension to POSIX pread:
+        # pread(fd, buf, count, file_offset, buf_offset) writes `count` bytes
+        # starting at `buf_offset` within buf.
         buf2 = np.full(128, 255, dtype=np.uint8)
         assert fs.pread(fd, buf2, 64, 256, 64) == 64
         assert np.array_equal(buf2[64:128], np.arange(64, dtype=np.uint8))
