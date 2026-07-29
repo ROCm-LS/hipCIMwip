@@ -42,8 +42,11 @@ SCENARIO("CuImage format detection and metadata accessors", "[test_cuimage.cpp]"
 
             THEN("Its metadata is parsed and available")
             {
-                // Opening parses immediately (is_loaded()==true); operator bool()
-                // reports the transient pre-parse state and is false here.
+                // Opening parses immediately (is_loaded()==true). Per its
+                // documented contract (see CuImage::operator bool() in
+                // cuimage.h), operator bool() reports only the detected-but-not-
+                // yet-parsed state, so it is intentionally false once loaded;
+                // this pins that behaviour and is not a validity check.
                 REQUIRE(image.is_loaded());
                 REQUIRE_FALSE(static_cast<bool>(image));
                 REQUIRE(image.dims() == "YXC");

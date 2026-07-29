@@ -113,6 +113,12 @@ public:
 
     ~CuImage();
 
+    /// Reports only the transient "format detected but not yet parsed" state: it
+    /// is true when a format plugin has been resolved (image_format_) *and* the
+    /// image has not been loaded yet (!is_loaded_). This is intentional and is
+    /// not a general validity check -- for an opened image it is effectively the
+    /// inverse of is_loaded(), so a fully parsed image yields false here. Use
+    /// is_loaded() to test whether pixels/metadata are available.
     operator bool() const
     {
         return !!image_format_ && !is_loaded_;

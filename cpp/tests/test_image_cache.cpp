@@ -87,7 +87,12 @@ SCENARIO("PerProcess image cache operations", "[test_image_cache.cpp]")
             for (uint64_t i = 0; i < 10; ++i)
             {
                 auto key = cache->create_key(1, i + 1);
-                auto value = cache->create_value(cache->allocate(value_size), value_size);
+                // allocate() can return nullptr under memory pressure; fail the
+                // test clearly here rather than wrapping/inserting a null value
+                // that could be dereferenced later.
+                void* buf = cache->allocate(value_size);
+                REQUIRE(buf != nullptr);
+                auto value = cache->create_value(buf, value_size);
                 cache->insert(key, value);
             }
 
