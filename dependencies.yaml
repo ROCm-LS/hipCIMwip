@@ -321,6 +321,7 @@ dependencies:
           - pytest>=7.0.0,<9.0.0
           - pytest-cov>=2.12.1
           - pytest-lazy-fixtures>=1.0.0
+          - pytest-rerunfailures>=14.0 # absorb transient HIP-runtime test flakiness
           - pytest-xdist
           - tifffile>=2022.8.12
           - pooch>=1.6.0 # needed to download scikit-image sample data

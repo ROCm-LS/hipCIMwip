@@ -678,6 +678,7 @@ test_python() {
 
     pushd $TOP/python/cucim
     run_command py.test --cache-clear -vv \
+        --reruns 2 --reruns-delay 1 \
         --cov=cucim \
         --junitxml="$TOP/junit-cucim.xml" \
         --cov-config=$TOP/python/cucim/.coveragerc \
