@@ -306,6 +306,24 @@ build_local_libhipcim_() {
     popd
 }
 
+coverage_cxx_flags_() {
+    # Echo the shared CMAKE_CXX_FLAGS for the plugin builds: any --gcc-toolchain,
+    # plus (when $1 == ON) LLVM coverage instrumentation. The plugin CMake
+    # projects do not honor ENABLE_CODE_COVERAGE, so the flags are injected
+    # directly. Do NOT override the C compiler or add C coverage flags: the
+    # bundled third-party C libs (e.g. openjpeg) fail to build when forced
+    # through hipcc/clang++ (-x c) with coverage flags.
+    local enable_coverage="${1:-OFF}"
+    local cxx_flags=""
+    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
+        cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
+    fi
+    if [ "${enable_coverage}" = "ON" ]; then
+        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
+    fi
+    echo "${cxx_flags}"
+}
+
 build_local_hipslide_() {
     local source_folder=${1:-${TOP}/cpp/plugins/cucim.kit.cuslide}
     local cucim_source_folder=${TOP}
@@ -321,20 +339,10 @@ build_local_hipslide_() {
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
 
-    # Inject LLVM coverage instrumentation (plus any --gcc-toolchain) into
-    # CMAKE_CXX_FLAGS. The plugin CMake project does not honor
-    # ENABLE_CODE_COVERAGE, so the flags are injected directly here.
+    # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
-    local cxx_flags=""
-    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
-        cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
-    fi
-    if [ "${enable_coverage}" = "ON" ]; then
-        # Instrument only C++ sources. Do NOT override the C compiler or add C
-        # coverage flags: the bundled third-party C libs (e.g. openjpeg) fail to
-        # build when forced through hipcc/clang++ (-x c) with coverage flags.
-        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
-    fi
+    local cxx_flags
+    cxx_flags="$(coverage_cxx_flags_ "${enable_coverage}")"
     [ -n "${cxx_flags}" ] && extra_cmake_args+=("-DCMAKE_CXX_FLAGS=${cxx_flags}")
 
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
@@ -376,20 +384,10 @@ build_local_hipmed_() {
     export CMAKE_PREFIX_PATH=/opt/rocm/lib/cmake
     export CMAKE_MODULE_PATH=/opt/rocm/lib/cmake
 
-    # Inject LLVM coverage instrumentation (plus any --gcc-toolchain) into
-    # CMAKE_CXX_FLAGS. The plugin CMake project does not honor
-    # ENABLE_CODE_COVERAGE, so the flags are injected directly here.
+    # Shared --gcc-toolchain + coverage flags (see coverage_cxx_flags_).
     local extra_cmake_args=()
-    local cxx_flags=""
-    if [ -n "${GCC_TOOLCHAIN_ROOT:-}" ]; then
-        cxx_flags="--gcc-toolchain=${GCC_TOOLCHAIN_ROOT}"
-    fi
-    if [ "${enable_coverage}" = "ON" ]; then
-        # Instrument only C++ sources. Do NOT override the C compiler or add C
-        # coverage flags: the bundled third-party C libs (e.g. openjpeg) fail to
-        # build when forced through hipcc/clang++ (-x c) with coverage flags.
-        cxx_flags="${cxx_flags} -fprofile-instr-generate -fcoverage-mapping -g"
-    fi
+    local cxx_flags
+    cxx_flags="$(coverage_cxx_flags_ "${enable_coverage}")"
     [ -n "${cxx_flags}" ] && extra_cmake_args+=("-DCMAKE_CXX_FLAGS=${cxx_flags}")
 
     ${CMAKE_CMD} -S ${source_folder} -B ${build_folder} -G "Unix Makefiles" \
