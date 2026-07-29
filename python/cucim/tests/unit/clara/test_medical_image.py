@@ -79,6 +79,9 @@ def _write_dicom(path, rows, cols, samples=1, implicit_vr=False, geometry=False)
     )
     # The file-meta group is always Explicit VR LE.
     meta = _dicom_element(0x0002, 0x0010, b"UI", transfer_syntax)
+    # (0002,0000) FileMetaInformationGroupLength is the byte count of all file-
+    # meta elements that follow it. TransferSyntaxUID is the only one here, so
+    # len(meta) is the full group length; extend this sum if more are added.
     meta_group_length = _dicom_element(
         0x0002, 0x0000, b"UL", struct.pack("<I", len(meta))
     )
@@ -183,10 +186,13 @@ def test_read_nifti_gzip(tmp_path):
 
 def test_read_nifti_big_endian(tmp_path):
     path = tmp_path / "be.nii"
-    _write_nifti(path, nx=4, ny=3, nz=2, big_endian=True)
+    # Use a multi-byte datatype (512 = uint16) so the read actually exercises
+    # the big-endian byte-swap; uint8 would be byte-order-agnostic.
+    _write_nifti(path, nx=4, ny=3, nz=2, datatype=512, big_endian=True)
 
     arr = np.asarray(CuImage(str(path)).read_region())
-    assert np.array_equal(arr.ravel(), np.arange(24))
+    assert arr.dtype == np.uint16
+    assert np.array_equal(arr.ravel(), np.arange(24, dtype=np.uint16))
 
 
 @pytest.mark.parametrize("datatype", [4, 16, 64, 512])

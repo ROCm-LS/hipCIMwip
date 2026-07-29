@@ -3,12 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import importlib.util
+
 import pytest
 
 from ...util.io import open_image_cucim
 
-# skip if imagecodecs package not available (needed by ImageGenerator utility)
-pytest.importorskip("imagecodecs")
+# Only the tests that build a JPEG test image (via the ImageGenerator-backed
+# testimg_* fixture) need imagecodecs; guard just those so the fixture-less
+# tests still run when imagecodecs is absent.
+requires_imagecodecs = pytest.mark.skipif(
+    importlib.util.find_spec("imagecodecs") is None,
+    reason="imagecodecs not installed (needed to generate the JPEG test image)",
+)
 
 
 def test_load_non_existing_image():
@@ -16,6 +23,7 @@ def test_load_non_existing_image():
         _ = open_image_cucim("/tmp/non_existing_image.tif")
 
 
+@requires_imagecodecs
 def test_read_region_save_ppm(testimg_tiff_stripe_32x24_16_jpeg, tmp_path):
     from cucim import CuImage
 
@@ -31,6 +39,7 @@ def test_read_region_save_ppm(testimg_tiff_stripe_32x24_16_jpeg, tmp_path):
     assert len(data) > 16 * 16 * 3
 
 
+@requires_imagecodecs
 def test_associated_image_missing_returns_empty(
     testimg_tiff_stripe_32x24_16_jpeg,
 ):
@@ -39,10 +48,11 @@ def test_associated_image_missing_returns_empty(
     img = CuImage(testimg_tiff_stripe_32x24_16_jpeg)
     # The generated test image has no associated images.
     assert img.associated_images == set()
-    # Requesting a non-existent associated image yields an empty CuImage.
-    assert not img.associated_image("does_not_exist")
+    # Requesting a non-existent associated image yields an unloaded CuImage.
+    assert not img.associated_image("does_not_exist").is_loaded
 
 
+@requires_imagecodecs
 def test_read_region_is_iterable(testimg_tiff_stripe_32x24_16_jpeg):
     from cucim import CuImage
 
