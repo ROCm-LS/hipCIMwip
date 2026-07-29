@@ -539,6 +539,11 @@ static bool reader_read_nifti(CuCIMFileHandle* handle,
     uint8_t* raster = static_cast<uint8_t*>(cucim_malloc(raster_size));
     memcpy(raster, info.raw_bytes.data() + info.data_offset, raster_size);
 
+    // Big-endian NIfTI: parse() swapped the header only; the voxel payload must
+    // be swapped to native order here before it is staged to the device.
+    if (info.big_endian)
+        cumed::nifti::byteswap_voxels(raster, nvox, info.vox_bytes);
+
     // Stage to GPU if requested
     cucim::memory::move_raster_from_host((void**)&raster, raster_size, out_device);
 

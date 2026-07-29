@@ -128,6 +128,37 @@ static inline void byteswap_header(Nifti1Header& h)
                              h.srow_z[i]=bswap_float(h.srow_z[i]); }
 }
 
+// Byte-swap an array of voxels in place, converting big-endian file data to the
+// host's native little-endian order. vox_bytes is the element size in bytes;
+// 1 (and any unrecognized size) is a no-op since single bytes are endian-
+// agnostic. Used only when the NIfTI header signalled big-endian storage.
+static inline void byteswap_voxels(uint8_t* data, size_t nvox, size_t vox_bytes)
+{
+    switch (vox_bytes)
+    {
+    case 2:
+    {
+        auto* p = reinterpret_cast<uint16_t*>(data);
+        for (size_t i = 0; i < nvox; ++i) p[i] = __builtin_bswap16(p[i]);
+        break;
+    }
+    case 4:
+    {
+        auto* p = reinterpret_cast<uint32_t*>(data);
+        for (size_t i = 0; i < nvox; ++i) p[i] = __builtin_bswap32(p[i]);
+        break;
+    }
+    case 8:
+    {
+        auto* p = reinterpret_cast<uint64_t*>(data);
+        for (size_t i = 0; i < nvox; ++i) p[i] = __builtin_bswap64(p[i]);
+        break;
+    }
+    default:
+        break; // 1-byte voxels (or unknown) need no swap
+    }
+}
+
 // ── File content loader (returns full file bytes) ─────────────────────────────
 static inline std::vector<uint8_t> read_file_bytes(int fd)
 {
